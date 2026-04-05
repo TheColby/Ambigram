@@ -1,5 +1,5 @@
 # Ambigram
-### Massive 64-Bit AI-driven Ambient Sound Generator
+Massive 64-Bit AI-driven Ambient Sound Generator
 
 > *No samples. No loops. Every sound synthesized from first principles in real time.*
 
