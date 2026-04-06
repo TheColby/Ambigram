@@ -16,11 +16,29 @@ import { useState, useEffect, useRef, useCallback } from "react";
 //  NOISE BUFFER FACTORIES
 // ─────────────────────────────────────────────
 
+// ─────────────────────────────────────────────
+//  TPDF DITHER — triangular probability density function
+//  Converts 64-bit double computation → Float32 storage
+//  with noise-shaped quantization error (no harmonic distortion)
+// ─────────────────────────────────────────────
+
+const F32_LSB = Math.pow(2, -23); // 1 ULP of Float32
+
+function tpdf() {
+  // Two independent uniform randoms → triangular distribution
+  // Mean = 0, eliminates DC bias in quantization error
+  return (Math.random() - Math.random()) * F32_LSB;
+}
+
+// ─────────────────────────────────────────────
+//  NOISE BUFFER FACTORIES  (computed at 64-bit, dithered to Float32)
+// ─────────────────────────────────────────────
+
 function makeWhiteBuffer(ctx, sec = 3) {
   const n = ctx.sampleRate * sec;
   const buf = ctx.createBuffer(1, n, ctx.sampleRate);
   const d = buf.getChannelData(0);
-  for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) + tpdf();
   return buf;
 }
 
@@ -28,13 +46,14 @@ function makePinkBuffer(ctx, sec = 3) {
   const n = ctx.sampleRate * sec;
   const buf = ctx.createBuffer(1, n, ctx.sampleRate);
   const d = buf.getChannelData(0);
+  // Paul Kellet's refined pink noise — all arithmetic in 64-bit doubles
   let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0,b6=0;
   for (let i = 0; i < n; i++) {
     const w = Math.random() * 2 - 1;
     b0 = 0.99886*b0 + w*0.0555179; b1 = 0.99332*b1 + w*0.0750759;
     b2 = 0.96900*b2 + w*0.1538520; b3 = 0.86650*b3 + w*0.3104856;
     b4 = 0.55000*b4 + w*0.5329522; b5 = -0.7616*b5 - w*0.0168980;
-    d[i] = (b0+b1+b2+b3+b4+b5+b6+w*0.5362)*0.11;
+    d[i] = (b0+b1+b2+b3+b4+b5+b6+w*0.5362)*0.11 + tpdf();
     b6 = w * 0.115926;
   }
   return buf;
@@ -44,11 +63,12 @@ function makeBrownBuffer(ctx, sec = 3) {
   const n = ctx.sampleRate * sec;
   const buf = ctx.createBuffer(1, n, ctx.sampleRate);
   const d = buf.getChannelData(0);
+  // Brownian motion integration — accumulator stays in 64-bit
   let last = 0;
   for (let i = 0; i < n; i++) {
     const w = Math.random() * 2 - 1;
-    last = (last + 0.02 * w) / 1.02;
-    d[i] = last * 3.5;
+    last = (last + 0.02 * w) / 1.02;   // leaky integrator
+    d[i] = last * 3.5 + tpdf();
   }
   return buf;
 }
@@ -111,12 +131,30 @@ class AmbigramEngine {
     this.drySend = null;
     this.synths = {};
     this.ready = false;
+    this.sampleRate = 96000;
   }
 
-  async init() {
+  async teardown() {
+    if (!this.ctx) return;
+    // Stop all active synths gracefully
+    Object.values(this.synths).forEach(s => { try { s.stop && s.stop(); } catch(_) {} });
+    await this.ctx.close();
+    this.ctx = null;
+    this.master = null;
+    this.reverbSend = null;
+    this.reverb = null;
+    this.drySend = null;
+    this.synths = {};
+    this.ready = false;
+  }
+
+  async init(sampleRate = this.sampleRate) {
     if (this.ready) return;
-    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    this.sampleRate = sampleRate;
+    this.ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
     if (this.ctx.state === "suspended") await this.ctx.resume();
+    // Actual rate the browser granted (may differ from requested)
+    this.actualSampleRate = this.ctx.sampleRate;
 
     this.master = this.ctx.createGain();
     this.master.gain.value = 0.85;
@@ -162,6 +200,135 @@ class AmbigramEngine {
   setReverb(mix) {
     if (!this.reverbSend) return;
     this.reverbSend.gain.linearRampToValueAtTime(mix * 0.45, this.ctx.currentTime + 0.1);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  WAV ENCODER — 16-bit PCM, 24-bit PCM, 32-bit IEEE float
+//  All arithmetic stays in 64-bit JS doubles until final write
+// ─────────────────────────────────────────────
+
+function writeString(view, offset, str) {
+  for (let i = 0; i < str.length; i++)
+    view.setUint8(offset + i, str.charCodeAt(i));
+}
+
+function encodeWAV(left, right, sampleRate, bitDepth) {
+  const numCh   = right ? 2 : 1;
+  const numFrames = left.length;
+  const bps     = bitDepth === 24 ? 3 : bitDepth / 8; // bytes per sample
+  const blockAlign = numCh * bps;
+  const byteRate   = sampleRate * blockAlign;
+  const dataSize   = numFrames * numCh * bps;
+  const buf = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buf);
+
+  // RIFF header
+  writeString(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(view, 8, "WAVE");
+  // fmt chunk
+  writeString(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, bitDepth === 32 ? 3 : 1, true); // 3 = IEEE float, 1 = PCM
+  view.setUint16(22, numCh, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitDepth, true);
+  // data chunk
+  writeString(view, 36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < numFrames; i++) {
+    const channels = right ? [left[i], right[i]] : [left[i]];
+    for (const s of channels) {
+      const clamped = Math.max(-1, Math.min(1, s));
+      if (bitDepth === 16) {
+        // 64-bit double → Int16 with TPDF dither
+        const dithered = clamped + tpdf() * 2;
+        view.setInt16(offset, Math.round(dithered * 0x7FFF), true);
+        offset += 2;
+      } else if (bitDepth === 24) {
+        // 64-bit double → Int24 with TPDF dither
+        const dithered = clamped + tpdf();
+        const val = Math.round(dithered * 0x7FFFFF);
+        view.setUint8(offset,     val & 0xFF);
+        view.setUint8(offset + 1, (val >> 8)  & 0xFF);
+        view.setUint8(offset + 2, (val >> 16) & 0xFF);
+        offset += 3;
+      } else {
+        // 32-bit IEEE float — no dither needed, native format
+        view.setFloat32(offset, clamped, true);
+        offset += 4;
+      }
+    }
+  }
+  return buf;
+}
+
+function downloadWAV(arrayBuffer, filename) {
+  const blob = new Blob([arrayBuffer], { type: "audio/wav" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+// ─────────────────────────────────────────────
+//  RECORDER NODE — taps master bus, accumulates stereo PCM
+//  Uses ScriptProcessorNode (deprecated but universally supported).
+//  bufferSize 2048 keeps latency minimal at 96kHz.
+// ─────────────────────────────────────────────
+
+class RecorderNode {
+  constructor(ctx, sourceNode) {
+    this.ctx = ctx;
+    this.recording = false;
+    this._chunksL = [];
+    this._chunksR = [];
+    this._totalFrames = 0;
+
+    // ScriptProcessorNode: 2 in, 2 out — must stay connected to destination
+    this._proc = ctx.createScriptProcessor(2048, 2, 2);
+    this._proc.onaudioprocess = (e) => {
+      if (!this.recording) return;
+      // Copy both channels (Float32 from Web Audio = 32-bit in flight,
+      // but we immediately upcast to 64-bit doubles via slice())
+      const L = e.inputBuffer.getChannelData(0);
+      const R = e.inputBuffer.getChannelData(1);
+      this._chunksL.push(new Float64Array(L)); // 64-bit storage
+      this._chunksR.push(new Float64Array(R));
+      this._totalFrames += L.length;
+    };
+
+    sourceNode.connect(this._proc);
+    this._proc.connect(ctx.destination); // required or callback never fires
+  }
+
+  start() {
+    this._chunksL = []; this._chunksR = [];
+    this._totalFrames = 0;
+    this.recording = true;
+  }
+
+  stop() {
+    this.recording = false;
+    // Flatten chunks → two contiguous Float64Arrays
+    const L = new Float64Array(this._totalFrames);
+    const R = new Float64Array(this._totalFrames);
+    let off = 0;
+    for (let i = 0; i < this._chunksL.length; i++) {
+      L.set(this._chunksL[i], off);
+      R.set(this._chunksR[i], off);
+      off += this._chunksL[i].length;
+    }
+    return { L, R, frames: this._totalFrames };
+  }
+
+  destroy() {
+    this._proc.disconnect();
   }
 }
 
@@ -242,6 +409,8 @@ class WaterfallSynth {
     this.gainNode.connect(dry); this.gainNode.connect(wet);
 
     // Three resonant bands simulate the layered roar
+    // Store both filter and gain nodes for live param control
+    this.bandGains = [];
     this.bands = [
       { f: 320, Q: 1.2 }, { f: 780, Q: 0.8 }, { f: 1800, Q: 0.6 },
       { f: 4200, Q: 0.5 }, { f: 9000, Q: 0.4 },
@@ -250,6 +419,7 @@ class WaterfallSynth {
       bp.type = "bandpass"; bp.frequency.value = f; bp.Q.value = Q;
       const g = ctx.createGain(); g.gain.value = f < 500 ? 0.9 : f < 2000 ? 0.6 : 0.35;
       bp.connect(g); g.connect(this.gainNode);
+      this.bandGains.push(g);
       return bp;
     });
 
@@ -361,13 +531,24 @@ class ThunderSynth {
   }
 
   trigger() {
-    const ctx = this.ctx; const t = ctx.currentTime;
+    const ctx = this.ctx;
+    // Start well ahead of currentTime so all param scheduling is deterministic
+    const t   = ctx.currentTime + 0.05;
     const dur = 3.5 + Math.random() * 4;
 
-    const buf = makeBrownBuffer(ctx, Math.ceil(dur) + 1);
-    const src = ctx.createBufferSource(); src.buffer = buf;
+    // ── Rumble — pre-faded noise buffer (fade-in baked into sample data)
+    // This avoids ALL gain scheduling on the rumble path and eliminates
+    // the click that happens when a non-zero sample suddenly appears.
+    const fadeMs = 120; // ms of sample-level fade-in
+    const fadeSamples = Math.round(ctx.sampleRate * fadeMs / 1000);
+    const rumbleBuf  = makeBrownBuffer(ctx, Math.ceil(dur) + 1);
+    const rumbleData = rumbleBuf.getChannelData(0);
+    for (let i = 0; i < fadeSamples && i < rumbleData.length; i++) {
+      rumbleData[i] *= i / fadeSamples; // linear fade-in in sample domain
+    }
 
-    // Rumble resonators
+    const src = ctx.createBufferSource(); src.buffer = rumbleBuf;
+
     const resonances = [48, 72, 96, 140, 210].map(freq => {
       const bp = ctx.createBiquadFilter();
       bp.type = "bandpass"; bp.frequency.value = freq;
@@ -376,9 +557,8 @@ class ThunderSynth {
     });
 
     const master = ctx.createGain();
-    master.gain.setValueAtTime(0, t);
-    master.gain.linearRampToValueAtTime(0.55 * this.level, t + 0.08);
-    master.gain.setValueAtTime(0.55 * this.level, t + 0.3);
+    master.gain.setValueAtTime(0.55 * this.level, t); // constant — no ramp needed
+    master.gain.setValueAtTime(0.55 * this.level, t + 0.5);
     master.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     master.connect(this.dry); master.connect(this.wet);
 
@@ -387,16 +567,28 @@ class ThunderSynth {
       src.connect(bp); bp.connect(g); g.connect(master);
     });
 
-    // Initial crack — bandlimited noise burst
-    const crackBuf = makeWhiteBuffer(ctx, 0.15);
-    const crack = ctx.createBufferSource(); crack.buffer = crackBuf;
+    // ── Crack — similarly pre-faded in sample domain
+    const crackBuf  = makeWhiteBuffer(ctx, 0.25);
+    const crackData = crackBuf.getChannelData(0);
+    const crackFade = Math.round(ctx.sampleRate * 0.006); // 6ms
+    for (let i = 0; i < crackFade && i < crackData.length; i++) {
+      crackData[i] *= i / crackFade;
+    }
+    // Also apply the amplitude envelope in sample domain
+    const crackTotal = crackData.length;
+    for (let i = 0; i < crackTotal; i++) {
+      const env = Math.pow(1 - i / crackTotal, 1.8); // exponential decay shape
+      crackData[i] *= env * 0.65 * this.level;
+    }
+
+    const crack   = ctx.createBufferSource(); crack.buffer = crackBuf;
     const crackHp = ctx.createBiquadFilter();
-    crackHp.type = "highpass"; crackHp.frequency.value = 200;
-    const crackGain = ctx.createGain();
-    crackGain.gain.setValueAtTime(0.7 * this.level, t);
-    crackGain.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
-    crack.connect(crackHp); crackHp.connect(crackGain); crackGain.connect(this.dry);
-    crack.start(t); crack.stop(t + 0.15);
+    crackHp.type = "highpass"; crackHp.frequency.value = 180;
+    const crackLp = ctx.createBiquadFilter();
+    crackLp.type = "lowpass";  crackLp.frequency.value = 7000;
+    // No gain node on crack path — envelope is baked into the buffer
+    crack.connect(crackHp); crackHp.connect(crackLp); crackLp.connect(this.dry);
+    crack.start(t); crack.stop(t + 0.26);
 
     src.start(t); src.stop(t + dur + 0.1);
   }
@@ -532,8 +724,8 @@ class BeeSynth {
     // AM envelope — wing beats at 200Hz
     this._lfo = ctx.createOscillator(); this._lfo.type = "sine";
     this._lfo.frequency.value = 210 + Math.random() * 40;
-    const lfoGain = ctx.createGain(); lfoGain.gain.value = 0.4;
-    this._lfo.connect(lfoGain); lfoGain.connect(this.gainNode.gain);
+    this._lfoGain = ctx.createGain(); this._lfoGain.gain.value = 0.4;
+    this._lfo.connect(this._lfoGain); this._lfoGain.connect(this.gainNode.gain);
     this._lfo.start();
 
     // Lowpass for buzz character
@@ -699,7 +891,13 @@ class WaterDripSynth {
     this.ctx = ctx; this.active = false; this.level = 0.5;
     this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
     this.gainNode.connect(dry); this.gainNode.connect(wet);
-    this._timer = null;
+    this._timer    = null;
+    // Param defaults — overridden live via LAYER_PARAMS apply()
+    this._rateScale = 1;
+    this._pitchLow  = 300;
+    this._pitchHigh = 1200;
+    this._decay     = 0.992;
+    this._tail      = 1.2;
   }
 
   start() {
@@ -722,22 +920,25 @@ class WaterDripSynth {
 
   _schedule() {
     if (!this.active) return;
-    const ms = 400 + Math.random() * (3000 / (this.level + 0.15));
+    const baseMs = 400 + Math.random() * (3000 / (this.level + 0.15));
+    const ms = baseMs / Math.max(0.1, this._rateScale);
     this._timer = setTimeout(() => { this._drip(); this._schedule(); }, ms);
   }
 
   _drip() {
     const ctx = this.ctx; const t = ctx.currentTime;
-    const freq = 300 + Math.random() * 1200;
-    const buf = karplusStrong(ctx, freq, 0.992 + Math.random() * 0.005, 1.2);
-    const src = ctx.createBufferSource(); src.buffer = buf;
-    const g = ctx.createGain(); g.gain.value = 0.25 * this.level;
-    // tiny splash envelope
-    const env = ctx.createGain();
+    const range = Math.max(10, this._pitchHigh - this._pitchLow);
+    const freq  = this._pitchLow + Math.random() * range;
+    const decay = Math.max(0.9, Math.min(0.9999, this._decay + (Math.random() - 0.5) * 0.005));
+    const tail  = Math.max(0.1, this._tail);
+    const buf   = karplusStrong(ctx, freq, decay, tail);
+    const src   = ctx.createBufferSource(); src.buffer = buf;
+    const g     = ctx.createGain(); g.gain.value = 0.25 * this.level;
+    const env   = ctx.createGain();
     env.gain.setValueAtTime(1, t);
-    env.gain.exponentialRampToValueAtTime(0.0001, t + 1.3);
+    env.gain.exponentialRampToValueAtTime(0.0001, t + tail * 1.1);
     src.connect(g); g.connect(env); env.connect(this.gainNode);
-    src.start(t); src.stop(t + 1.4);
+    src.start(t); src.stop(t + tail + 0.1);
   }
 }
 
@@ -750,7 +951,7 @@ class SwampSynth {
     this.ctx = ctx; this.active = false; this.level = 0.5;
     this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
     this.gainNode.connect(dry); this.gainNode.connect(wet);
-    this._oscs = [];
+    this._oscs = []; this._lfos = []; this._noiseLp = null;
   }
 
   start() {
@@ -762,26 +963,25 @@ class SwampSynth {
       const osc = ctx.createOscillator();
       osc.type = i < 2 ? "triangle" : "sine";
       osc.frequency.value = freq;
-      // slow LFO pitch wobble
       const lfo = ctx.createOscillator(); lfo.type = "sine";
       lfo.frequency.value = 0.03 + i * 0.01;
       const lfoG = ctx.createGain(); lfoG.gain.value = 0.4;
       lfo.connect(lfoG); lfoG.connect(osc.frequency);
-
       const g = ctx.createGain(); g.gain.value = 0.07;
       osc.connect(g); g.connect(this.gainNode);
       osc.start(); lfo.start();
-      this._oscs.push(osc, lfo);
+      this._oscs.push(osc); this._lfos.push(lfo);
     });
 
-    // Brown noise undertone
+    // Brown noise undertone — store noiseLp for live param control
     const brownBuf = makeBrownBuffer(ctx, 4);
     const noiseSrc = ctx.createBufferSource();
     noiseSrc.buffer = brownBuf; noiseSrc.loop = true;
-    const noiseLp = ctx.createBiquadFilter(); noiseLp.type = "lowpass";
-    noiseLp.frequency.value = 180;
+    this._noiseLp = ctx.createBiquadFilter();
+    this._noiseLp.type = "lowpass"; this._noiseLp.frequency.value = 180;
     const noiseG = ctx.createGain(); noiseG.gain.value = 0.15;
-    noiseSrc.connect(noiseLp); noiseLp.connect(noiseG); noiseG.connect(this.gainNode);
+    noiseSrc.connect(this._noiseLp); this._noiseLp.connect(noiseG);
+    noiseG.connect(this.gainNode);
     noiseSrc.start(); this._oscs.push(noiseSrc);
 
     this.gainNode.gain.linearRampToValueAtTime(0.12 + 0.28 * this.level, ctx.currentTime + 3);
@@ -790,7 +990,8 @@ class SwampSynth {
   stop() {
     if (!this.active) return; this.active = false;
     this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 3);
-    this._oscs.forEach(o => o.stop(this.ctx.currentTime + 3.5)); this._oscs = [];
+    [...this._oscs, ...this._lfos].forEach(o => { try { o.stop(this.ctx.currentTime + 3.5); } catch(_){} });
+    this._oscs = []; this._lfos = []; this._noiseLp = null;
   }
 
   setLevel(v) {
@@ -949,8 +1150,128 @@ const PRESETS = {
 };
 
 // ─────────────────────────────────────────────
-//  LAYER DEFINITIONS (UI metadata)
+//  LAYER DEFINITIONS (UI metadata + per-layer param sliders)
 // ─────────────────────────────────────────────
+
+// Each param: { id, label, min, max, step, default, unit }
+// These drive the synth's audio-param nodes in real time via setParam().
+const LAYER_PARAMS = {
+  rain: [
+    { id: "bpFreq",    label: "Texture Freq", min: 800,  max: 8000, step: 50,  default: 2800, unit: "Hz",
+      apply: (s, v) => s.bp && (s.bp.frequency.value = v) },
+    { id: "bpQ",       label: "Texture Q",    min: 0.1,  max: 4,    step: 0.05, default: 0.4,  unit: "",
+      apply: (s, v) => s.bp && (s.bp.Q.value = v) },
+    { id: "hpFreq",    label: "Low Cut",      min: 60,   max: 800,  step: 10,  default: 250,  unit: "Hz",
+      apply: (s, v) => s.hp && (s.hp.frequency.value = v) },
+    { id: "hfGain",    label: "Air",          min: -6,   max: 12,   step: 0.5, default: 3,    unit: "dB",
+      apply: (s, v) => s.hs && (s.hs.gain.value = v) },
+    { id: "dropVol",   label: "Drop Vol",     min: 0,    max: 1,    step: 0.01,default: 0.04, unit: "",
+      apply: (s, v) => s._dropVolScale = v },
+  ],
+  waterfall: [
+    { id: "band0g",    label: "Roar (320Hz)", min: 0,    max: 2,    step: 0.05, default: 0.9, unit: "",
+      apply: (s, v) => s.bandGains?.[0] && (s.bandGains[0].gain.value = v) },
+    { id: "band1g",    label: "Body (780Hz)", min: 0,    max: 2,    step: 0.05, default: 0.6, unit: "",
+      apply: (s, v) => s.bandGains?.[1] && (s.bandGains[1].gain.value = v) },
+    { id: "band2g",    label: "Mid (1.8k)",   min: 0,    max: 2,    step: 0.05, default: 0.35,unit: "",
+      apply: (s, v) => s.bandGains?.[2] && (s.bandGains[2].gain.value = v) },
+    { id: "band3g",    label: "Spray (4.2k)", min: 0,    max: 2,    step: 0.05, default: 0.25,unit: "",
+      apply: (s, v) => s.bandGains?.[3] && (s.bandGains[3].gain.value = v) },
+    { id: "band4g",    label: "Mist (9k)",    min: 0,    max: 2,    step: 0.05, default: 0.15,unit: "",
+      apply: (s, v) => s.bandGains?.[4] && (s.bandGains[4].gain.value = v) },
+  ],
+  wind: [
+    { id: "lp1Freq",   label: "Cutoff",       min: 100,  max: 3000, step: 20,  default: 700,  unit: "Hz",
+      apply: (s, v) => s.lp1 && (s.lp1.frequency.value = v) },
+    { id: "lfoRate",   label: "Gust Rate",    min: 0.01, max: 0.8,  step: 0.01,default: 0.08, unit: "Hz",
+      apply: (s, v) => s.lfo && (s.lfo.frequency.value = v) },
+    { id: "lfoDepth",  label: "Gust Depth",   min: 0,    max: 1200, step: 20,  default: 500,  unit: "Hz",
+      apply: (s, v) => s.lfoGain && (s.lfoGain.gain.value = v) },
+    { id: "ampRate",   label: "Swell Rate",   min: 0.01, max: 0.3,  step: 0.005,default: 0.04,unit: "Hz",
+      apply: (s, v) => s.ampLfo && (s.ampLfo.frequency.value = v) },
+  ],
+  thunder: [
+    { id: "level",     label: "Strike Vol",   min: 0,    max: 1,    step: 0.01, default: 0.8, unit: "",
+      apply: (s, v) => (s.level = v) },
+    { id: "autoMin",   label: "Auto Min (s)", min: 4,    max: 60,   step: 1,    default: 8,   unit: "s",
+      apply: (s, v) => (s.autoMin = v * 1000) },
+    { id: "autoMax",   label: "Auto Max (s)", min: 10,   max: 120,  step: 1,    default: 33,  unit: "s",
+      apply: (s, v) => (s.autoMax = v * 1000) },
+  ],
+  birds: [
+    { id: "callRate",  label: "Call Rate",    min: 0.1,  max: 2,    step: 0.05, default: 1,   unit: "×",
+      apply: (s, v) => (s._rateScale = v) },
+    { id: "pitchMult", label: "Pitch",        min: 0.5,  max: 2,    step: 0.01, default: 1,   unit: "×",
+      apply: (s, v) => (s._pitchMult = v) },
+    { id: "vibratoD",  label: "Vibrato",      min: 0,    max: 60,   step: 1,    default: 15,  unit: "Hz",
+      apply: (s, v) => (s._vibratoDepth = v) },
+    { id: "chirpGap",  label: "Chirp Gap",    min: 0.5,  max: 3,    step: 0.1,  default: 1,   unit: "×",
+      apply: (s, v) => (s._chirpGapMult = v) },
+  ],
+  bees: [
+    { id: "wingSp",    label: "Wing Speed",   min: 100,  max: 400,  step: 5,    default: 210, unit: "Hz",
+      apply: (s, v) => s._lfo && (s._lfo.frequency.value = v) },
+    { id: "buzzFreq",  label: "Buzz Pitch",   min: 100,  max: 500,  step: 5,    default: 220, unit: "Hz",
+      apply: (s, v) => s._oscs && s._oscs.forEach((o, i) => (o.frequency.value = v * (1 + (i-3)*0.007))) },
+    { id: "lpFreq",    label: "Buzz Color",   min: 400,  max: 5000, step: 50,   default: 1800,unit: "Hz",
+      apply: (s, v) => s._lp && (s._lp.frequency.value = v) },
+    { id: "amDepth",   label: "AM Depth",     min: 0,    max: 0.8,  step: 0.01, default: 0.4, unit: "",
+      apply: (s, v) => s._lfoGain && (s._lfoGain.gain.value = v) },
+  ],
+  crickets: [
+    { id: "chirpRate", label: "Chirp Rate",   min: 4,    max: 30,   step: 0.5,  default: 14,  unit: "Hz",
+      apply: (s, v) => s._lfos && s._lfos.forEach((l, i) => (l.frequency.value = v + i*1.3)) },
+    { id: "pitch",     label: "Pitch",        min: 3000, max: 8000, step: 100,  default: 4800,unit: "Hz",
+      apply: (s, v) => s._oscs && s._oscs.forEach((o, i) => (o.frequency.value = v + i*300)) },
+    { id: "spread",    label: "Voice Spread", min: 0,    max: 600,  step: 20,   default: 300, unit: "Hz",
+      apply: (s, v) => s._oscs && s._oscs.forEach((o, i) => (o.frequency.value = (s._basePitch||4800) + i*v/3)) },
+  ],
+  frogs: [
+    { id: "callRate",  label: "Call Rate",    min: 0.2,  max: 3,    step: 0.1,  default: 1,   unit: "×",
+      apply: (s, v) => (s._rateScale = v) },
+    { id: "pitchMult", label: "Pitch",        min: 0.5,  max: 1.8,  step: 0.01, default: 1,   unit: "×",
+      apply: (s, v) => (s._pitchMult = v) },
+    { id: "resonQ",    label: "Body Resonance", min: 1,  max: 20,   step: 0.5,  default: 6,   unit: "",
+      apply: (s, v) => (s._resonQ = v) },
+  ],
+  drips: [
+    { id: "rateScale", label: "Drip Rate",    min: 0.1,  max: 4,    step: 0.1,  default: 1,   unit: "×",
+      apply: (s, v) => (s._rateScale = v) },
+    { id: "pitchLow",  label: "Pitch Low",    min: 80,   max: 800,  step: 20,   default: 300, unit: "Hz",
+      apply: (s, v) => (s._pitchLow = v) },
+    { id: "pitchHigh", label: "Pitch High",   min: 400,  max: 4000, step: 50,   default: 1200,unit: "Hz",
+      apply: (s, v) => (s._pitchHigh = v) },
+    { id: "decay",     label: "Ring Decay",   min: 0.97, max: 0.999,step: 0.001,default: 0.992,unit: "",
+      apply: (s, v) => (s._decay = v) },
+    { id: "tail",      label: "Ring Tail",    min: 0.2,  max: 3,    step: 0.1,  default: 1.2, unit: "s",
+      apply: (s, v) => (s._tail = v) },
+  ],
+  swamp: [
+    { id: "rootPitch", label: "Root Pitch",   min: 30,   max: 120,  step: 1,    default: 55,  unit: "Hz",
+      apply: (s, v) => s._oscs && s._oscs.filter(o=>o.frequency).forEach((o,i) => {
+        const ratios=[1,1.005,2,3,1.5]; o.frequency.value = v*(ratios[i]||1); }) },
+    { id: "wobbleRate",label: "Wobble Rate",  min: 0.01, max: 0.2,  step: 0.005,default: 0.04,unit: "Hz",
+      apply: (s, v) => s._lfos && s._lfos.forEach((l,i) => l.frequency && (l.frequency.value = v+i*0.01)) },
+    { id: "noiseLp",   label: "Mud Cutoff",   min: 40,   max: 600,  step: 10,   default: 180, unit: "Hz",
+      apply: (s, v) => s._noiseLp && (s._noiseLp.frequency.value = v) },
+  ],
+  heron: [
+    { id: "intervalMult",label: "Call Interval",min: 0.2,max: 4,   step: 0.1,  default: 1,   unit: "×",
+      apply: (s, v) => (s._intervalMult = v) },
+    { id: "pitchBase", label: "Squawk Pitch",  min: 100, max: 600,  step: 10,   default: 280, unit: "Hz",
+      apply: (s, v) => (s._pitchBase = v) },
+    { id: "numSquawks",label: "Squawks",       min: 1,   max: 6,    step: 1,    default: 3,   unit: "",
+      apply: (s, v) => (s._numSquawks = Math.round(v)) },
+  ],
+  gator: [
+    { id: "intervalMult",label: "Bellow Interval",min: 0.2,max: 4, step: 0.1,  default: 1,   unit: "×",
+      apply: (s, v) => (s._intervalMult = v) },
+    { id: "subFreq",   label: "Infra Pitch",   min: 10,  max: 60,   step: 1,    default: 22,  unit: "Hz",
+      apply: (s, v) => (s._subFreq = v) },
+    { id: "dur",       label: "Bellow Length", min: 1,   max: 10,   step: 0.5,  default: 4,   unit: "s",
+      apply: (s, v) => (s._dur = v) },
+  ],
+};
 
 const LAYERS = [
   { id: "rain",      label: "Rain",       icon: "🌧️",  color: "#4a9eff", category: "weather" },
@@ -961,7 +1282,7 @@ const LAYERS = [
   { id: "bees",      label: "Bees",       icon: "🐝",  color: "#ffd700", category: "nature"  },
   { id: "crickets",  label: "Crickets",   icon: "🦗",  color: "#98e08a", category: "nature"  },
   { id: "frogs",     label: "Frogs",      icon: "🐸",  color: "#4ecb71", category: "nature"  },
-  { id: "drips",     label: "Water Drips",icon: "💦",  color: "#63d0f5", category: "nature"  },
+  { id: "drips",     label: "Drops",      icon: "💦",  color: "#63d0f5", category: "nature"  },
   { id: "swamp",     label: "Swamp Drone",icon: "🌿",  color: "#6bcf8a", category: "everglades" },
   { id: "heron",     label: "Heron",      icon: "🦢",  color: "#c8e6c9", category: "everglades" },
   { id: "gator",     label: "Gator Rumble",icon: "🐊", color: "#8bc34a", category: "everglades" },
@@ -971,6 +1292,270 @@ const LAYERS = [
 //  REACT APP
 // ─────────────────────────────────────────────
 
+// ─────────────────────────────────────────────
+//  MIDI CONTROLLER — Web MIDI API
+//  CC assignments (all channels, remappable):
+//    CC 1  (Mod Wheel) → Master Volume
+//    CC 7  (Volume)    → Master Volume
+//    CC 11 (Expression)→ Reverb Mix
+//    CC 20–31          → Layer levels (rain, waterfall, wind, thunder,
+//                         birds, bees, crickets, frogs, drips, swamp,
+//                         heron, gator)
+//    CC 64 (Sustain)   → Thunder strike (gate high → trigger)
+//    CC 70–81          → First param of each layer (fine-tune live)
+//    Note On C3-B3     → Layer on/off toggle (12 semitones = 12 layers)
+// ─────────────────────────────────────────────
+
+const LAYER_ORDER = ["rain","waterfall","wind","thunder","birds","bees",
+                     "crickets","frogs","drips","swamp","heron","gator"];
+
+class MIDIController {
+  constructor(onCC, onLayerToggle, onThunder) {
+    this.onCC          = onCC;
+    this.onLayerToggle = onLayerToggle;
+    this.onThunder     = onThunder;
+    this.access        = null;
+    this.enabled       = false;
+    this._sustainHigh  = false;
+  }
+
+  async init() {
+    if (!navigator.requestMIDIAccess) {
+      console.warn("Web MIDI API not available in this browser.");
+      return false;
+    }
+    try {
+      this.access = await navigator.requestMIDIAccess({ sysex: false });
+      this._attachInputs();
+      this.access.onstatechange = () => this._attachInputs();
+      this.enabled = true;
+      return true;
+    } catch (e) {
+      console.warn("MIDI access denied:", e);
+      return false;
+    }
+  }
+
+  _attachInputs() {
+    this.access.inputs.forEach(input => {
+      input.onmidimessage = (msg) => this._handle(msg.data);
+    });
+  }
+
+  _handle(data) {
+    const [status, d1, d2] = data;
+    const type    = status & 0xF0;
+    const val01   = d2 / 127; // 0–1 normalised
+
+    // Control Change
+    if (type === 0xB0) {
+      if (d1 === 1 || d1 === 7)  return this.onCC("masterVol", val01);
+      if (d1 === 11)              return this.onCC("reverbMix", val01);
+      if (d1 >= 20 && d1 <= 31)  return this.onCC(`layer:${LAYER_ORDER[d1-20]}`, val01);
+      if (d1 >= 70 && d1 <= 81)  return this.onCC(`param0:${LAYER_ORDER[d1-70]}`, val01);
+      if (d1 === 64) {
+        if (d2 >= 64 && !this._sustainHigh) { this._sustainHigh = true; this.onThunder(); }
+        if (d2 < 64)  this._sustainHigh = false;
+      }
+    }
+
+    // Note On (velocity > 0) — toggle layers via C3-B3 (MIDI notes 48-59)
+    if (type === 0x90 && d2 > 0 && d1 >= 48 && d1 <= 59) {
+      this.onLayerToggle(LAYER_ORDER[d1 - 48]);
+    }
+  }
+
+  inputNames() {
+    if (!this.access) return [];
+    return Array.from(this.access.inputs.values()).map(i => i.name);
+  }
+
+  destroy() {
+    if (this.access) {
+      this.access.inputs.forEach(i => (i.onmidimessage = null));
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+//  OSC CONTROLLER — WebSocket bridge
+//  Expects a local bridge server (e.g. osc-web-bridge or node-osc)
+//  listening on ws://localhost:8080 that forwards UDP OSC packets.
+//
+//  Supported OSC addresses:
+//    /ambigram/master/volume  f  0.0–1.0
+//    /ambigram/master/reverb  f  0.0–1.0
+//    /ambigram/layer/<id>     f  0.0–1.0   (level)
+//    /ambigram/layer/<id>/on  i  1=on 0=off
+//    /ambigram/param/<id>/<paramId> f
+//    /ambigram/thunder/strike i  (any value → trigger)
+// ─────────────────────────────────────────────
+
+class OSCController {
+  constructor(onCC, onLayerToggle, onThunder, wsUrl = "ws://localhost:8080") {
+    this.onCC          = onCC;
+    this.onLayerToggle = onLayerToggle;
+    this.onThunder     = onThunder;
+    this.wsUrl         = wsUrl;
+    this.ws            = null;
+    this.enabled       = false;
+    this.status        = "disconnected"; // "disconnected" | "connecting" | "connected" | "error"
+    this._onStatus     = null;
+  }
+
+  connect(wsUrl = this.wsUrl) {
+    this.wsUrl  = wsUrl;
+    this.status = "connecting";
+    this._onStatus && this._onStatus(this.status);
+
+    try {
+      this.ws = new WebSocket(wsUrl);
+    } catch (e) {
+      this.status = "error";
+      this._onStatus && this._onStatus(this.status);
+      return;
+    }
+
+    this.ws.onopen = () => {
+      this.status  = "connected";
+      this.enabled = true;
+      this._onStatus && this._onStatus(this.status);
+    };
+
+    this.ws.onclose = () => {
+      this.status  = "disconnected";
+      this.enabled = false;
+      this._onStatus && this._onStatus(this.status);
+    };
+
+    this.ws.onerror = () => {
+      this.status  = "error";
+      this.enabled = false;
+      this._onStatus && this._onStatus(this.status);
+    };
+
+    this.ws.onmessage = (e) => {
+      try {
+        // Bridge sends JSON: { address: "/ambigram/...", args: [...] }
+        const { address, args } = JSON.parse(e.data);
+        this._dispatch(address, args);
+      } catch (_) {}
+    };
+  }
+
+  _dispatch(addr, args) {
+    const parts = addr.split("/").filter(Boolean); // ["ambigram", ...]
+    if (parts[0] !== "ambigram") return;
+
+    if (parts[1] === "master") {
+      if (parts[2] === "volume") return this.onCC("masterVol", Math.max(0, Math.min(1, args[0])));
+      if (parts[2] === "reverb") return this.onCC("reverbMix", Math.max(0, Math.min(1, args[0])));
+    }
+
+    if (parts[1] === "layer") {
+      const id = parts[2];
+      if (!id) return;
+      if (parts[3] === "on") return this.onLayerToggle(id, args[0] === 1 ? "on" : "off");
+      return this.onCC(`layer:${id}`, Math.max(0, Math.min(1, args[0])));
+    }
+
+    if (parts[1] === "param") {
+      const [,, layerId, paramId] = parts;
+      if (layerId && paramId)
+        return this.onCC(`param:${layerId}:${paramId}`, args[0]);
+    }
+
+    if (parts[1] === "thunder" && parts[2] === "strike") {
+      this.onThunder();
+    }
+  }
+
+  disconnect() {
+    if (this.ws) { this.ws.close(); this.ws = null; }
+    this.enabled = false;
+  }
+}
+
+// ─────────────────────────────────────────────
+//  EVOLUTION ENGINE — slow stochastic drift
+//  Each active layer's params wander within their allowed range
+//  using band-limited random walks (Ornstein-Uhlenbeck process).
+//  Period: full cycle in ~60–180 seconds. Completely imperceptible
+//  moment-to-moment but means the soundscape never sounds the same twice.
+// ─────────────────────────────────────────────
+
+class EvolutionEngine {
+  constructor() {
+    this._timer  = null;
+    this._active = false;
+    this._phase  = {}; // layerId → { paramId → phase(0-1) }
+    this._speed  = {}; // layerId → { paramId → drift speed }
+    this.onUpdate = null; // (layerId, paramId, newVal) => void
+    this.tickMs   = 500; // update every 500ms
+    this.strength = 0.25; // how far from default params can drift (0–1 of range)
+  }
+
+  start(layerParams) {
+    if (this._active) return;
+    this._active = true;
+    // Initialise random phases and speeds for each param
+    Object.entries(layerParams).forEach(([lid, params]) => {
+      this._phase[lid] = {};
+      this._speed[lid] = {};
+      params.forEach(p => {
+        this._phase[lid][p.id] = Math.random(); // random starting phase
+        // Random drift speed: completes ~0.3-1 full cycle per minute
+        this._speed[lid][p.id] = (0.005 + Math.random() * 0.012) * (Math.random() < 0.5 ? 1 : -1);
+      });
+    });
+    this._tick(layerParams);
+  }
+
+  stop() {
+    this._active = false;
+    clearTimeout(this._timer);
+  }
+
+  setStrength(v) { this.strength = Math.max(0, Math.min(1, v)); }
+
+  _tick(layerParams) {
+    if (!this._active) return;
+
+    Object.entries(layerParams).forEach(([lid, params]) => {
+      if (!this._phase[lid]) return;
+      params.forEach(p => {
+        // Advance phase
+        this._phase[lid][p.id] += this._speed[lid][p.id];
+        // Reflect at boundaries (ping-pong oscillation)
+        if (this._phase[lid][p.id] > 1) {
+          this._phase[lid][p.id] = 2 - this._phase[lid][p.id];
+          this._speed[lid][p.id] *= -1;
+        }
+        if (this._phase[lid][p.id] < 0) {
+          this._phase[lid][p.id] = -this._phase[lid][p.id];
+          this._speed[lid][p.id] *= -1;
+        }
+
+        // Map phase → value: wander within strength% of the full range
+        const mid   = (p.max + p.min) / 2;
+        const half  = (p.max - p.min) / 2 * this.strength;
+        const val   = mid + (this._phase[lid][p.id] * 2 - 1) * half;
+        const snapped = Math.round(val / p.step) * p.step;
+        const clamped = Math.max(p.min, Math.min(p.max, snapped));
+
+        if (this.onUpdate) this.onUpdate(lid, p.id, clamped);
+      });
+    });
+
+    this._timer = setTimeout(() => this._tick(layerParams), this.tickMs);
+  }
+}
+
+const evolutionEngine = new EvolutionEngine();
+
+const SAMPLE_RATES = [44100, 48000, 88200, 96000, 192000];
+const BIT_DEPTHS   = [16, 24, 32];
+
 const engine = new AmbigramEngine();
 
 export default function Ambigram() {
@@ -979,19 +1564,204 @@ export default function Ambigram() {
   const [reverbMix, setReverbMix] = useState(0.22);
   const [activePreset, setActivePreset] = useState(null);
   const [thunderAuto, setThunderAuto] = useState(false);
+  const [sampleRate, setSampleRate] = useState(96000);
+  const [bitDepth, setBitDepth]     = useState(32);
+  const [actualRate, setActualRate] = useState(null);
+  const [recording, setRecording]   = useState(false);
+  const [recDuration, setRecDuration] = useState(0);
+  const recorderRef  = useRef(null);
+  const recTimerRef  = useRef(null);
 
   // layerState: { id → { active: bool, level: number } }
   const [layerState, setLayerState] = useState(() =>
     Object.fromEntries(LAYERS.map(l => [l.id, { active: false, level: 0.5 }]))
   );
 
-  // Activity pulse for animated layers (birds, frogs, heron, gator)
-  const [pulseIds, setPulseIds] = useState(new Set());
+  // expandedCards: set of layer ids with param panel open
+  const [expandedCards, setExpandedCards] = useState(new Set());
 
-  const initAndStart = useCallback(async () => {
-    await engine.init();
-    setStarted(true);
+  // paramState: { layerId → { paramId → number } }
+  const [paramState, setParamState] = useState(() =>
+    Object.fromEntries(
+      Object.entries(LAYER_PARAMS).map(([lid, params]) => [
+        lid,
+        Object.fromEntries(params.map(p => [p.id, p.default]))
+      ])
+    )
+  );
+
+  const toggleExpand = useCallback((id) => {
+    setExpandedCards(prev => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
   }, []);
+
+  const setParam = useCallback((layerId, paramId, value) => {
+    setParamState(prev => ({
+      ...prev,
+      [layerId]: { ...prev[layerId], [paramId]: value }
+    }));
+    const synth = engine.synths[layerId];
+    const paramDef = LAYER_PARAMS[layerId]?.find(p => p.id === paramId);
+    if (synth && paramDef?.apply) {
+      try { paramDef.apply(synth, value); } catch(_) {}
+    }
+  }, []);
+
+  // ── MIDI / OSC ──────────────────────────────
+  const midiRef   = useRef(null);
+  const oscRef    = useRef(null);
+  const [midiEnabled,  setMidiEnabled]  = useState(false);
+  const [midiInputs,   setMidiInputs]   = useState([]);
+  const [oscStatus,    setOscStatus]    = useState("disconnected");
+  const [oscUrl,       setOscUrl]       = useState("ws://localhost:8080");
+  const [showControl,  setShowControl]  = useState(false);
+
+  // Unified CC handler — called by both MIDI and OSC
+  const handleCC = useCallback((key, val) => {
+    if (key === "masterVol") { setMasterVol(val); return; }
+    if (key === "reverbMix") { setReverbMix(val); return; }
+    if (key.startsWith("layer:")) {
+      const id = key.slice(6);
+      setLayerLevel(id, val);
+      return;
+    }
+    if (key.startsWith("param:")) {
+      const [,layerId, paramId] = key.split(":");
+      const paramDef = LAYER_PARAMS[layerId]?.find(p => p.id === paramId);
+      if (paramDef) {
+        const scaled = paramDef.min + val * (paramDef.max - paramDef.min);
+        setParam(layerId, paramId, scaled);
+      }
+      return;
+    }
+    if (key.startsWith("param0:")) {
+      const id = key.slice(7);
+      const params = LAYER_PARAMS[id];
+      if (params?.[0]) {
+        const p = params[0];
+        setParam(id, p.id, p.min + val * (p.max - p.min));
+      }
+    }
+  }, [setLayerLevel, setParam]);
+
+  const handleLayerToggleExternal = useCallback((id, mode) => {
+    const state = engine.synths[id];
+    if (!state) return;
+    if (mode === "on"  && !state.active) toggleLayer(id);
+    if (mode === "off" && state.active)  toggleLayer(id);
+    if (!mode) toggleLayer(id); // bare toggle (MIDI note)
+  }, [toggleLayer]);
+
+  const initMIDI = useCallback(async () => {
+    if (!midiRef.current) {
+      midiRef.current = new MIDIController(handleCC, handleLayerToggleExternal, triggerThunder);
+    }
+    const ok = await midiRef.current.init();
+    if (ok) {
+      setMidiEnabled(true);
+      setMidiInputs(midiRef.current.inputNames());
+    }
+  }, [handleCC, handleLayerToggleExternal, triggerThunder]);
+
+  const connectOSC = useCallback(() => {
+    if (!oscRef.current) {
+      oscRef.current = new OSCController(handleCC, handleLayerToggleExternal, triggerThunder, oscUrl);
+      oscRef.current._onStatus = setOscStatus;
+    }
+    oscRef.current.connect(oscUrl);
+  }, [handleCC, handleLayerToggleExternal, triggerThunder, oscUrl]);
+
+  const disconnectOSC = useCallback(() => {
+    oscRef.current?.disconnect();
+  }, []);
+
+  // ── EVOLUTION ───────────────────────────────
+  const [evolveOn,       setEvolveOn]       = useState(false);
+  const [evolveStrength, setEvolveStrength] = useState(0.25);
+
+  const toggleEvolve = useCallback(() => {
+    setEvolveOn(prev => {
+      const next = !prev;
+      if (next) {
+        evolutionEngine.setStrength(evolveStrength);
+        evolutionEngine.onUpdate = (lid, pid, val) => {
+          // Only evolve active layers
+          const synth = engine.synths[lid];
+          if (!synth?.active) return;
+          const paramDef = LAYER_PARAMS[lid]?.find(p => p.id === pid);
+          if (paramDef?.apply) { try { paramDef.apply(synth, val); } catch(_){} }
+          setParamState(ps => ({ ...ps, [lid]: { ...ps[lid], [pid]: val } }));
+        };
+        evolutionEngine.start(LAYER_PARAMS);
+      } else {
+        evolutionEngine.stop();
+      }
+      return next;
+    });
+  }, [evolveStrength]);
+
+  useEffect(() => {
+    if (evolveOn) evolutionEngine.setStrength(evolveStrength);
+  }, [evolveStrength, evolveOn]);
+
+  // Cleanup on unmount
+  useEffect(() => () => { evolutionEngine.stop(); }, []);
+
+  const initAndStart = useCallback(async (sr = sampleRate) => {
+    await engine.init(sr);
+    setActualRate(engine.actualSampleRate);
+    setStarted(true);
+  }, [sampleRate]);
+
+  // Reinitialize engine when sample rate changes after first start
+  const changeSampleRate = useCallback(async (newRate) => {
+    setSampleRate(newRate);
+    if (!started) return;
+    // Stop recorder if running
+    if (recorderRef.current) {
+      recorderRef.current.destroy();
+      recorderRef.current = null;
+      setRecording(false);
+      clearInterval(recTimerRef.current);
+    }
+    // Tear down and rebuild
+    await engine.teardown();
+    setStarted(false);
+    setLayerState(Object.fromEntries(LAYERS.map(l => [l.id, { active: false, level: 0.5 }])));
+    setThunderAuto(false);
+    await engine.init(newRate);
+    setActualRate(engine.actualSampleRate);
+    setStarted(true);
+  }, [started]);
+
+  const startRecording = useCallback(() => {
+    if (!started || recording) return;
+    const recorder = new RecorderNode(engine.ctx, engine.master);
+    recorder.start();
+    recorderRef.current = recorder;
+    setRecording(true);
+    setRecDuration(0);
+    recTimerRef.current = setInterval(() => setRecDuration(d => d + 1), 1000);
+  }, [started, recording]);
+
+  const stopRecording = useCallback(() => {
+    if (!recorderRef.current) return;
+    clearInterval(recTimerRef.current);
+    const { L, R, frames } = recorderRef.current.stop();
+    recorderRef.current.destroy();
+    recorderRef.current = null;
+    setRecording(false);
+    setRecDuration(0);
+
+    if (frames === 0) return;
+    const sr  = engine.actualSampleRate || engine.sampleRate;
+    const wav = encodeWAV(L, R, sr, bitDepth);
+    const ts  = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    downloadWAV(wav, `ambigram-${ts}-${sr}hz-${bitDepth}bit.wav`);
+  }, [bitDepth]);
 
   // Master volume
   useEffect(() => {
@@ -1100,7 +1870,30 @@ export default function Ambigram() {
           <div style={styles.logo}>🌿</div>
           <h1 style={styles.title}>AMBIGRAM</h1>
           <p style={styles.subtitle}>AI-driven ambient generation<br/>Physical modeling · Analog synthesis</p>
-          <button style={styles.startBtn} onClick={initAndStart}>
+
+          {/* Pre-launch audio format selectors */}
+          <div style={styles.formatRow}>
+            <div style={styles.formatGroup}>
+              <label style={styles.formatLabel}>SAMPLE RATE</label>
+              <select style={styles.select} value={sampleRate}
+                onChange={e => setSampleRate(+e.target.value)}>
+                {SAMPLE_RATES.map(r => (
+                  <option key={r} value={r}>{(r/1000).toFixed(r % 1000 === 0 ? 0 : 1)} kHz</option>
+                ))}
+              </select>
+            </div>
+            <div style={styles.formatGroup}>
+              <label style={styles.formatLabel}>BIT DEPTH</label>
+              <select style={styles.select} value={bitDepth}
+                onChange={e => setBitDepth(+e.target.value)}>
+                {BIT_DEPTHS.map(b => (
+                  <option key={b} value={b}>{b}-bit{b === 32 ? " float" : " PCM"}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <button style={styles.startBtn} onClick={() => initAndStart(sampleRate)}>
             ▶ Begin Session
           </button>
           <p style={styles.hint}>Rain · Waterfall · Wind · Birds · Bees · Frogs · Everglades</p>
@@ -1123,9 +1916,62 @@ export default function Ambigram() {
           <label style={styles.label}>VOL</label>
           <input type="range" min={0} max={1} step={0.01} value={masterVol}
             style={styles.slider} onChange={e => setMasterVol(+e.target.value)} />
-          <label style={{ ...styles.label, marginLeft: 16 }}>REVERB</label>
+          <label style={{ ...styles.label, marginLeft: 12 }}>REVERB</label>
           <input type="range" min={0} max={1} step={0.01} value={reverbMix}
             style={styles.slider} onChange={e => setReverbMix(+e.target.value)} />
+
+          {/* Format controls — live */}
+          <div style={styles.divider} />
+          <label style={styles.label}>SR</label>
+          <select style={styles.selectSm} value={sampleRate}
+            onChange={e => changeSampleRate(+e.target.value)}>
+            {SAMPLE_RATES.map(r => (
+              <option key={r} value={r}>{(r/1000).toFixed(r % 1000 === 0 ? 0 : 1)}k</option>
+            ))}
+          </select>
+          {actualRate && actualRate !== sampleRate && (
+            <span style={styles.rateWarn} title="Browser granted a different rate">
+              ⚠ {(actualRate/1000).toFixed(1)}k
+            </span>
+          )}
+          <label style={{ ...styles.label, marginLeft: 8 }}>BITS</label>
+          <select style={styles.selectSm} value={bitDepth}
+            onChange={e => setBitDepth(+e.target.value)}>
+            {BIT_DEPTHS.map(b => (
+              <option key={b} value={b}>{b}</option>
+            ))}
+          </select>
+
+          <div style={styles.divider} />
+
+          {/* Record button */}
+          <button
+            style={{
+              ...styles.recBtn,
+              background: recording ? "#ff304480" : "rgba(255,48,68,0.12)",
+              borderColor: recording ? "#ff3044" : "#882233",
+              color: recording ? "#ff8090" : "#884455",
+            }}
+            onClick={recording ? stopRecording : startRecording}>
+            {recording
+              ? `⏹ ${Math.floor(recDuration/60)}:${String(recDuration%60).padStart(2,"0")}`
+              : "⏺ REC"}
+          </button>
+
+          <div style={styles.divider} />
+          <label style={styles.label}>EVOLVE</label>
+          <input type="range" min={0} max={1} step={0.01} value={evolveStrength}
+            style={{ ...styles.slider, width: 60, accentColor: "#c084fc" }}
+            onChange={e => setEvolveStrength(+e.target.value)} />
+          <button style={{ ...styles.recBtn,
+            background: evolveOn ? "#c084fc33" : "transparent",
+            borderColor: evolveOn ? "#c084fc" : "#442255",
+            color:       evolveOn ? "#c084fc" : "#553366",
+            minWidth: 60 }}
+            onClick={toggleEvolve}>
+            {evolveOn ? "● LIVE" : "○ OFF"}
+          </button>
+
           <button style={styles.stopBtn} onClick={stopAll}>■ Stop All</button>
         </div>
       </div>
@@ -1139,7 +1985,64 @@ export default function Ambigram() {
             {name}
           </button>
         ))}
+        <div style={{ flex: 1 }} />
+        <button style={{ ...styles.presetBtn, borderColor: showControl ? "#c084fc88" : undefined,
+          color: showControl ? "#c084fc" : undefined }}
+          onClick={() => setShowControl(v => !v)}>
+          ⚡ MIDI / OSC
+        </button>
       </div>
+
+      {/* MIDI / OSC control panel */}
+      {showControl && (
+        <div style={styles.controlPanel}>
+          {/* MIDI */}
+          <div style={styles.controlSection}>
+            <div style={styles.controlTitle}>MIDI</div>
+            <button style={{ ...styles.ctrlBtn, borderColor: midiEnabled ? "#7dde92" : "#444",
+              color: midiEnabled ? "#7dde92" : "#888" }}
+              onClick={initMIDI}>
+              {midiEnabled ? "✓ Connected" : "Connect MIDI"}
+            </button>
+            {midiEnabled && midiInputs.length > 0 && (
+              <div style={styles.ctrlNote}>
+                {midiInputs.map((n,i) => <div key={i}>↳ {n}</div>)}
+              </div>
+            )}
+            <div style={styles.ctrlNote}>
+              CC 1/7 → Vol · CC 11 → Reverb<br/>
+              CC 20-31 → Layer levels · CC 64 → Strike<br/>
+              Note C3-B3 → Toggle layers
+            </div>
+          </div>
+
+          {/* OSC */}
+          <div style={styles.controlSection}>
+            <div style={styles.controlTitle}>OSC (WebSocket bridge)</div>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <input style={styles.ctrlInput} value={oscUrl}
+                onChange={e => setOscUrl(e.target.value)} />
+              {oscStatus === "connected"
+                ? <button style={{ ...styles.ctrlBtn, borderColor: "#ff5050", color: "#ff8080" }}
+                    onClick={disconnectOSC}>Disconnect</button>
+                : <button style={{ ...styles.ctrlBtn, borderColor: "#c084fc", color: "#c084fc" }}
+                    onClick={connectOSC}>Connect</button>
+              }
+            </div>
+            <div style={{ ...styles.ctrlNote,
+              color: oscStatus === "connected" ? "#7dde92"
+                   : oscStatus === "error"     ? "#ff8080"
+                   : "#556c5c" }}>
+              {oscStatus}
+            </div>
+            <div style={styles.ctrlNote}>
+              /ambigram/master/volume f<br/>
+              /ambigram/layer/&lt;id&gt; f<br/>
+              /ambigram/thunder/strike i
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Layer groups */}
       <div style={styles.content}>
@@ -1150,80 +2053,98 @@ export default function Ambigram() {
               {layers.map(layer => {
                 const state = layerState[layer.id];
                 const isThunder = layer.id === "thunder";
+                const isOn = state.active || (isThunder && thunderAuto);
+                const expanded = expandedCards.has(layer.id);
+                const params = LAYER_PARAMS[layer.id] || [];
+                const pState = paramState[layer.id] || {};
 
                 return (
                   <div key={layer.id} style={{
                     ...styles.card,
-                    borderColor: state.active || (isThunder && thunderAuto)
-                      ? layer.color : "rgba(255,255,255,0.08)",
-                    boxShadow: state.active || (isThunder && thunderAuto)
-                      ? `0 0 18px ${layer.color}55` : "none",
+                    width: expanded ? 240 : 110,
+                    flexDirection: expanded ? "row" : "column",
+                    alignItems: expanded ? "flex-start" : "center",
+                    borderColor: isOn ? layer.color : "rgba(255,255,255,0.08)",
+                    boxShadow: isOn ? `0 0 18px ${layer.color}55` : "none",
                   }}>
-                    {/* Icon + name */}
-                    <div style={styles.cardTop}>
-                      <span style={{ fontSize: 24 }}>{layer.icon}</span>
-                      <span style={{ ...styles.cardLabel, color: state.active ? layer.color : "#aaa" }}>
-                        {layer.label}
-                      </span>
+
+                    {/* Left column: always visible */}
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center",
+                      gap: 8, minWidth: 82 }}>
+                      <div style={styles.cardTop}>
+                        <span style={{ fontSize: 22 }}>{layer.icon}</span>
+                        <span style={{ ...styles.cardLabel, color: isOn ? layer.color : "#aaa" }}>
+                          {layer.label}
+                        </span>
+                      </div>
+
+                      <div style={{ ...styles.dot, background: isOn ? layer.color : "#333" }} />
+
+                      {!isThunder && (
+                        <div style={styles.faderWrap}>
+                          <div style={styles.faderTrack}>
+                            <div style={{ ...styles.faderFill, height: `${state.level * 100}%`, background: layer.color }} />
+                          </div>
+                          <input type="range" min={0} max={1} step={0.01}
+                            value={state.level} orient="vertical"
+                            style={styles.faderInput}
+                            onChange={e => setLayerLevel(layer.id, +e.target.value)} />
+                        </div>
+                      )}
+
+                      {isThunder ? (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 5, width: "100%" }}>
+                          <button style={{ ...styles.toggleBtn, background: layer.color+"33",
+                            borderColor: layer.color, color: layer.color }}
+                            onClick={triggerThunder}>Strike</button>
+                          <button style={{ ...styles.toggleBtn, fontSize: 10,
+                            background: thunderAuto ? layer.color+"55" : "transparent",
+                            borderColor: layer.color+"88",
+                            color: thunderAuto ? layer.color : "#888" }}
+                            onClick={() => { const n=!thunderAuto; setThunderAuto(n); engine.synths.thunder.setAutoMode(n); }}>
+                            {thunderAuto ? "Auto ON" : "Auto OFF"}
+                          </button>
+                        </div>
+                      ) : (
+                        <button style={{ ...styles.toggleBtn,
+                          background: state.active ? layer.color+"33" : "transparent",
+                          borderColor: state.active ? layer.color : "#444",
+                          color: state.active ? layer.color : "#666" }}
+                          onClick={() => toggleLayer(layer.id)}>
+                          {state.active ? "ON" : "OFF"}
+                        </button>
+                      )}
+
+                      {params.length > 0 && (
+                        <button style={{ ...styles.expandBtn,
+                          borderColor: expanded ? layer.color+"88" : "#333",
+                          color: expanded ? layer.color : "#555" }}
+                          onClick={() => toggleExpand(layer.id)}>
+                          {expanded ? "▲" : "▼"}
+                        </button>
+                      )}
                     </div>
 
-                    {/* Active indicator */}
-                    <div style={{
-                      ...styles.dot,
-                      background: (state.active || (isThunder && thunderAuto)) ? layer.color : "#333",
-                    }} />
-
-                    {/* Level fader (not for thunder) */}
-                    {!isThunder && (
-                      <div style={styles.faderWrap}>
-                        <div style={styles.faderTrack}>
-                          <div style={{
-                            ...styles.faderFill,
-                            height: `${state.level * 100}%`,
-                            background: layer.color,
-                          }} />
-                        </div>
-                        <input type="range" min={0} max={1} step={0.01}
-                          value={state.level} orient="vertical"
-                          style={styles.faderInput}
-                          onChange={e => setLayerLevel(layer.id, +e.target.value)} />
+                    {/* Right column: param sliders (visible when expanded) */}
+                    {expanded && params.length > 0 && (
+                      <div style={styles.paramPanel}>
+                        {params.map(p => (
+                          <div key={p.id} style={styles.paramRow}>
+                            <label style={{ ...styles.paramLabel, color: layer.color + "cc" }}>
+                              {p.label}
+                            </label>
+                            <input type="range" min={p.min} max={p.max} step={p.step}
+                              value={pState[p.id] ?? p.default}
+                              style={{ ...styles.paramSlider, accentColor: layer.color }}
+                              onChange={e => setParam(layer.id, p.id, +e.target.value)} />
+                            <span style={styles.paramVal}>
+                              {(pState[p.id] ?? p.default).toFixed(
+                                p.step < 1 ? (p.step < 0.01 ? 3 : 2) : 0
+                              )}{p.unit}
+                            </span>
+                          </div>
+                        ))}
                       </div>
-                    )}
-
-                    {/* Toggle / trigger button */}
-                    {isThunder ? (
-                      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                        <button style={{
-                          ...styles.toggleBtn,
-                          background: layer.color + "33",
-                          borderColor: layer.color,
-                          color: layer.color,
-                        }} onClick={triggerThunder}>
-                          Strike
-                        </button>
-                        <button style={{
-                          ...styles.toggleBtn,
-                          background: thunderAuto ? layer.color + "55" : "transparent",
-                          borderColor: layer.color + "88",
-                          color: thunderAuto ? layer.color : "#888",
-                          fontSize: 10,
-                        }} onClick={() => {
-                          const next = !thunderAuto;
-                          setThunderAuto(next);
-                          engine.synths.thunder.setAutoMode(next);
-                        }}>
-                          {thunderAuto ? "Auto ON" : "Auto OFF"}
-                        </button>
-                      </div>
-                    ) : (
-                      <button style={{
-                        ...styles.toggleBtn,
-                        background: state.active ? layer.color + "33" : "transparent",
-                        borderColor: state.active ? layer.color : "#444",
-                        color: state.active ? layer.color : "#666",
-                      }} onClick={() => toggleLayer(layer.id)}>
-                        {state.active ? "ON" : "OFF"}
-                      </button>
                     )}
                   </div>
                 );
@@ -1237,6 +2158,8 @@ export default function Ambigram() {
       <div style={styles.footer}>
         Physical Modeling · FM Synthesis · Analog Subtractive · Karplus-Strong · AM Synthesis
         &nbsp;·&nbsp; Pure Web Audio API — no samples
+        &nbsp;·&nbsp; {actualRate ? `${(actualRate/1000).toFixed(actualRate % 1000 === 0 ? 0 : 1)} kHz` : `${sampleRate/1000} kHz`}
+        &nbsp;·&nbsp; {bitDepth}-bit {bitDepth === 32 ? "float" : "PCM"} · 64-bit compute · TPDF dither
       </div>
     </div>
   );
@@ -1349,5 +2272,89 @@ const styles = {
   footer: {
     textAlign: "center", color: "#2a4a32", fontSize: 10, letterSpacing: 1.5,
     padding: "32px 24px 0", borderTop: "1px solid rgba(255,255,255,0.03)", marginTop: 12,
+  },
+
+  // ── MIDI/OSC control panel styles ────────────
+  controlPanel: {
+    display: "flex", gap: 32, padding: "14px 24px",
+    background: "rgba(0,0,0,0.3)", borderBottom: "1px solid rgba(192,132,252,0.15)",
+    flexWrap: "wrap",
+  },
+  controlSection: {
+    display: "flex", flexDirection: "column", gap: 6, minWidth: 200,
+  },
+  controlTitle: {
+    color: "#c084fc", fontSize: 10, letterSpacing: 3, marginBottom: 2,
+  },
+  ctrlBtn: {
+    background: "transparent", border: "1px solid #444", borderRadius: 5,
+    color: "#888", padding: "5px 14px", cursor: "pointer",
+    fontSize: 11, fontFamily: "inherit", letterSpacing: 1,
+  },
+  ctrlNote: {
+    color: "#445", fontSize: 10, lineHeight: 1.7, letterSpacing: 0.5,
+  },
+  ctrlInput: {
+    background: "#0a140c", border: "1px solid #2a3a2c", color: "#7dde92",
+    borderRadius: 4, padding: "4px 8px", fontSize: 11,
+    fontFamily: "'Courier New', monospace", flex: 1, outline: "none",
+  },
+
+  // ── Param panel styles ──────────────────────
+  expandBtn: {
+    border: "1px solid #333", borderRadius: 4, padding: "2px 8px",
+    cursor: "pointer", fontSize: 9, background: "transparent", fontFamily: "inherit",
+    letterSpacing: 1, transition: "all 0.15s", width: "100%",
+  },
+  paramPanel: {
+    flex: 1, display: "flex", flexDirection: "column", gap: 6,
+    paddingLeft: 10, borderLeft: "1px solid rgba(255,255,255,0.06)",
+    minWidth: 0,
+  },
+  paramRow: {
+    display: "flex", alignItems: "center", gap: 6,
+  },
+  paramLabel: {
+    fontSize: 9, letterSpacing: 0.5, width: 76, flexShrink: 0,
+    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+  },
+  paramSlider: {
+    flex: 1, height: 2, cursor: "pointer", minWidth: 0,
+  },
+  paramVal: {
+    fontSize: 9, color: "#556", width: 38, textAlign: "right", flexShrink: 0,
+    fontVariantNumeric: "tabular-nums",
+  },
+
+  // ── Format / record styles ──────────────────
+  formatRow: {
+    display: "flex", gap: 24, justifyContent: "center", margin: "0 0 32px",
+  },
+  formatGroup: {
+    display: "flex", flexDirection: "column", alignItems: "center", gap: 6,
+  },
+  formatLabel: {
+    color: "#4a7a54", fontSize: 10, letterSpacing: 3,
+  },
+  select: {
+    background: "#0e1f12", border: "1px solid #2a5a34", color: "#7dde92",
+    borderRadius: 6, padding: "8px 14px", fontSize: 13, fontFamily: "'Courier New', monospace",
+    cursor: "pointer", outline: "none",
+  },
+  selectSm: {
+    background: "#0a140c", border: "1px solid #1e3d22", color: "#7dde92",
+    borderRadius: 4, padding: "3px 8px", fontSize: 11, fontFamily: "'Courier New', monospace",
+    cursor: "pointer", outline: "none",
+  },
+  divider: {
+    width: 1, height: 20, background: "rgba(255,255,255,0.1)", margin: "0 4px",
+  },
+  recBtn: {
+    border: "1px solid #882233", borderRadius: 6, padding: "5px 12px",
+    cursor: "pointer", fontSize: 11, fontFamily: "'Courier New', monospace",
+    letterSpacing: 1, transition: "all 0.15s", minWidth: 72,
+  },
+  rateWarn: {
+    color: "#ffaa44", fontSize: 10, letterSpacing: 1,
   },
 };
