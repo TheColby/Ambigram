@@ -191,7 +191,54 @@ mindmap
       Mixer UI
       Preset Control
       Master Chain
+      MIDI Learn
+      OSC Bridge
 ```
+
+---
+
+## MIDI And OSC Control
+
+Ambigram now includes a dedicated **MIDI / OSC** control panel for live hardware control.
+
+### MIDI
+
+- Uses the **Web MIDI API** directly in the browser.
+- Keeps the original default mappings:
+  - `CC 1` or `CC 7` → master volume
+  - `CC 11` → reverb mix
+  - `CC 20–31` → layer levels
+  - `CC 64` → thunder strike
+  - `Note C3–B3` → layer toggles
+  - `CC 70–81` → first parameter on each layer
+- Adds **MIDI Learn** so any physical fader, knob, or button on your controller can be assigned to:
+  - master volume
+  - reverb mix
+  - thunder strike
+  - every layer level
+- Learned bindings are saved in `localStorage`, so your fader box layout persists between sessions.
+
+### OSC
+
+- OSC is handled through a **WebSocket bridge** such as a local Node-based OSC relay.
+- Default bridge URL: `ws://localhost:8080`
+- Supported OSC addresses:
+  - `/ambigram/master/volume f`
+  - `/ambigram/master/reverb f`
+  - `/ambigram/layer/<id> f`
+  - `/ambigram/layer/<id>/on i`
+  - `/ambigram/param/<id>/<paramId> f`
+  - `/ambigram/thunder/strike i`
+
+### Recommended Fader Box Workflow
+
+1. Start Ambigram and open the `MIDI / OSC` panel.
+2. Click `Enable MIDI`.
+3. Press `Learn` beside the control you want.
+4. Move the hardware fader or knob you want assigned.
+5. Repeat for the layer strips you want on the box.
+
+This makes it practical to dedicate a bank of physical faders to rain, waterfall, wind, birds, frogs, swamp, and the rest of the live mix.
 
 ---
 

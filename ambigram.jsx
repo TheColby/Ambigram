@@ -1292,6 +1292,153 @@ const LAYERS = [
 //  REACT APP
 // ─────────────────────────────────────────────
 
+const MIDI_BINDINGS_STORAGE_KEY = "ambigram-midi-bindings-v1";
+const OSC_URL_STORAGE_KEY = "ambigram-osc-url-v1";
+
+function loadStoredJSON(key, fallback) {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function loadStoredString(key, fallback) {
+  if (typeof window === "undefined") return fallback;
+  try {
+    return window.localStorage.getItem(key) || fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function clamp01(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  return Math.max(0, Math.min(1, num));
+}
+
+function normalizeMidiBinding(binding) {
+  if (!binding || typeof binding !== "object") return null;
+
+  const channel = Number(binding.channel);
+  const normalizedChannel =
+    Number.isInteger(channel) && channel >= 1 && channel <= 16 ? channel : null;
+
+  if (binding.type === "cc") {
+    const controller = Number(binding.controller);
+    if (!Number.isInteger(controller) || controller < 0 || controller > 127) return null;
+    return { type: "cc", controller, channel: normalizedChannel };
+  }
+
+  if (binding.type === "noteon") {
+    const note = Number(binding.note);
+    if (!Number.isInteger(note) || note < 0 || note > 127) return null;
+    return { type: "noteon", note, channel: normalizedChannel };
+  }
+
+  return null;
+}
+
+function loadMidiBindings() {
+  const raw = loadStoredJSON(MIDI_BINDINGS_STORAGE_KEY, {});
+  if (!raw || typeof raw !== "object") return {};
+
+  return Object.fromEntries(
+    Object.entries(raw)
+      .map(([key, binding]) => {
+        const normalized = normalizeMidiBinding(binding);
+        return normalized ? [key, normalized] : null;
+      })
+      .filter(Boolean)
+  );
+}
+
+function midiEventToBinding(event) {
+  if (event?.type === "cc") {
+    return normalizeMidiBinding({
+      type: "cc",
+      controller: event.controller,
+      channel: event.channel,
+    });
+  }
+
+  if (event?.type === "noteon") {
+    return normalizeMidiBinding({
+      type: "noteon",
+      note: event.note,
+      channel: event.channel,
+    });
+  }
+
+  return null;
+}
+
+function midiBindingMatches(binding, event) {
+  if (!binding || !event || binding.type !== event.type) return false;
+  if (binding.channel && binding.channel !== event.channel) return false;
+  if (binding.type === "cc") return binding.controller === event.controller;
+  if (binding.type === "noteon") return binding.note === event.note;
+  return false;
+}
+
+function describeMidiBinding(binding) {
+  if (!binding) return "Not mapped";
+  const channel = binding.channel ? ` ch${binding.channel}` : " any ch";
+  if (binding.type === "cc") return `CC ${binding.controller}${channel}`;
+  return `Note ${binding.note}${channel}`;
+}
+
+function formatMidiEvent(event) {
+  if (!event) return "Waiting for MIDI data.";
+  const channel = `ch${event.channel}`;
+  if (event.type === "cc") return `Last: CC ${event.controller} ${channel} = ${event.value}`;
+  if (event.type === "noteon") return `Last: Note ${event.note} ${channel} vel ${event.value}`;
+  return `Last: Note ${event.note} ${channel} off`;
+}
+
+function legacyMidiBindingLabel(key) {
+  if (key === "masterVol") return "Default: CC 1 or 7";
+  if (key === "reverbMix") return "Default: CC 11";
+  if (key === "thunderStrike") return "Default: CC 64";
+  if (key.startsWith("layer:")) {
+    const id = key.slice(6);
+    const index = LAYER_ORDER.indexOf(id);
+    if (index >= 0) return `Default: CC ${20 + index}`;
+  }
+  return "No default";
+}
+
+function getOscArgValue(value) {
+  if (Array.isArray(value)) return getOscArgValue(value[0]);
+  if (value && typeof value === "object") {
+    if ("value" in value) return getOscArgValue(value.value);
+    if ("data" in value) return getOscArgValue(value.data);
+  }
+  const num = Number(value);
+  return Number.isFinite(num) ? num : value;
+}
+
+function getFirstOscArg(args) {
+  if (!Array.isArray(args) || args.length === 0) return undefined;
+  return getOscArgValue(args[0]);
+}
+
+function parseOscToggleMode(value) {
+  if (typeof value === "boolean") return value ? "on" : "off";
+  if (typeof value === "string") {
+    const lowered = value.toLowerCase();
+    if (["1", "on", "true"].includes(lowered)) return "on";
+    if (["0", "off", "false"].includes(lowered)) return "off";
+    return null;
+  }
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  return num >= 0.5 ? "on" : "off";
+}
+
 // ─────────────────────────────────────────────
 //  MIDI CONTROLLER — Web MIDI API
 //  CC assignments (all channels, remappable):
@@ -1309,17 +1456,30 @@ const LAYERS = [
 const LAYER_ORDER = ["rain","waterfall","wind","thunder","birds","bees",
                      "crickets","frogs","drips","swamp","heron","gator"];
 
+const MIDI_LEARN_TARGETS = [
+  { key: "masterVol", label: "Master Volume" },
+  { key: "reverbMix", label: "Reverb Mix" },
+  { key: "thunderStrike", label: "Thunder Strike" },
+  ...LAYER_ORDER.map(id => ({
+    key: `layer:${id}`,
+    label: `${LAYERS.find(layer => layer.id === id)?.label || id} Level`,
+  })),
+];
+
 class MIDIController {
-  constructor(onCC, onLayerToggle, onThunder) {
-    this.onCC          = onCC;
-    this.onLayerToggle = onLayerToggle;
-    this.onThunder     = onThunder;
-    this.access        = null;
-    this.enabled       = false;
-    this._sustainHigh  = false;
+  constructor(onMessage) {
+    this.onMessage = onMessage;
+    this.access = null;
+    this.enabled = false;
+    this._onInputsChange = null;
   }
 
   async init() {
+    if (this.access) {
+      this._attachInputs();
+      this.enabled = true;
+      return true;
+    }
     if (!navigator.requestMIDIAccess) {
       console.warn("Web MIDI API not available in this browser.");
       return false;
@@ -1337,31 +1497,49 @@ class MIDIController {
   }
 
   _attachInputs() {
+    const names = [];
     this.access.inputs.forEach(input => {
       input.onmidimessage = (msg) => this._handle(msg.data);
+      names.push(input.name || "Unnamed MIDI Input");
     });
+    this._onInputsChange && this._onInputsChange(names);
   }
 
   _handle(data) {
-    const [status, d1, d2] = data;
-    const type    = status & 0xF0;
-    const val01   = d2 / 127; // 0–1 normalised
+    const [status, d1 = 0, d2 = 0] = data;
+    const type = status & 0xF0;
+    const channel = (status & 0x0F) + 1;
 
-    // Control Change
     if (type === 0xB0) {
-      if (d1 === 1 || d1 === 7)  return this.onCC("masterVol", val01);
-      if (d1 === 11)              return this.onCC("reverbMix", val01);
-      if (d1 >= 20 && d1 <= 31)  return this.onCC(`layer:${LAYER_ORDER[d1-20]}`, val01);
-      if (d1 >= 70 && d1 <= 81)  return this.onCC(`param0:${LAYER_ORDER[d1-70]}`, val01);
-      if (d1 === 64) {
-        if (d2 >= 64 && !this._sustainHigh) { this._sustainHigh = true; this.onThunder(); }
-        if (d2 < 64)  this._sustainHigh = false;
-      }
+      this.onMessage?.({
+        type: "cc",
+        channel,
+        controller: d1,
+        value: d2,
+        value01: d2 / 127,
+      });
+      return;
     }
 
-    // Note On (velocity > 0) — toggle layers via C3-B3 (MIDI notes 48-59)
-    if (type === 0x90 && d2 > 0 && d1 >= 48 && d1 <= 59) {
-      this.onLayerToggle(LAYER_ORDER[d1 - 48]);
+    if (type === 0x90) {
+      this.onMessage?.({
+        type: d2 > 0 ? "noteon" : "noteoff",
+        channel,
+        note: d1,
+        value: d2,
+        value01: d2 / 127,
+      });
+      return;
+    }
+
+    if (type === 0x80) {
+      this.onMessage?.({
+        type: "noteoff",
+        channel,
+        note: d1,
+        value: d2,
+        value01: d2 / 127,
+      });
     }
   }
 
@@ -1372,8 +1550,10 @@ class MIDIController {
 
   destroy() {
     if (this.access) {
+      this.access.onstatechange = null;
       this.access.inputs.forEach(i => (i.onmidimessage = null));
     }
+    this.enabled = false;
   }
 }
 
@@ -1392,10 +1572,11 @@ class MIDIController {
 // ─────────────────────────────────────────────
 
 class OSCController {
-  constructor(onCC, onLayerToggle, onThunder, wsUrl = "ws://localhost:8080") {
+  constructor(onCC, onLayerToggle, onThunder, onParam, wsUrl = "ws://localhost:8080") {
     this.onCC          = onCC;
     this.onLayerToggle = onLayerToggle;
     this.onThunder     = onThunder;
+    this.onParam       = onParam;
     this.wsUrl         = wsUrl;
     this.ws            = null;
     this.enabled       = false;
@@ -1407,6 +1588,8 @@ class OSCController {
     this.wsUrl  = wsUrl;
     this.status = "connecting";
     this._onStatus && this._onStatus(this.status);
+
+    if (this.ws) this.disconnect();
 
     try {
       this.ws = new WebSocket(wsUrl);
@@ -1445,24 +1628,34 @@ class OSCController {
 
   _dispatch(addr, args) {
     const parts = addr.split("/").filter(Boolean); // ["ambigram", ...]
+    const firstArg = getFirstOscArg(args);
     if (parts[0] !== "ambigram") return;
 
     if (parts[1] === "master") {
-      if (parts[2] === "volume") return this.onCC("masterVol", Math.max(0, Math.min(1, args[0])));
-      if (parts[2] === "reverb") return this.onCC("reverbMix", Math.max(0, Math.min(1, args[0])));
+      const value = clamp01(firstArg);
+      if (value == null) return;
+      if (parts[2] === "volume" || parts[2] === "vol") return this.onCC("masterVol", value);
+      if (parts[2] === "reverb") return this.onCC("reverbMix", value);
     }
 
     if (parts[1] === "layer") {
       const id = parts[2];
       if (!id) return;
-      if (parts[3] === "on") return this.onLayerToggle(id, args[0] === 1 ? "on" : "off");
-      return this.onCC(`layer:${id}`, Math.max(0, Math.min(1, args[0])));
+      if (parts[3] === "on") {
+        const mode = parseOscToggleMode(firstArg);
+        if (mode) return this.onLayerToggle(id, mode);
+        return;
+      }
+      const value = clamp01(firstArg);
+      if (value != null) return this.onCC(`layer:${id}`, value);
+      return;
     }
 
     if (parts[1] === "param") {
       const [,, layerId, paramId] = parts;
-      if (layerId && paramId)
-        return this.onCC(`param:${layerId}:${paramId}`, args[0]);
+      const value = Number(firstArg);
+      if (layerId && paramId && Number.isFinite(value))
+        return this.onParam(layerId, paramId, value);
     }
 
     if (parts[1] === "thunder" && parts[2] === "strike") {
@@ -1610,13 +1803,55 @@ export default function Ambigram() {
     }
   }, []);
 
+  const triggerThunder = useCallback(() => {
+    if (!started || !engine.synths.thunder) return;
+    engine.synths.thunder.trigger();
+  }, [started]);
+
+  const setLayerLevel = useCallback((id, val) => {
+    if (!started) return;
+    const synth = engine.synths[id];
+    if (synth && synth.setLevel) synth.setLevel(val);
+    setLayerState(prev => ({ ...prev, [id]: { ...prev[id], level: val } }));
+  }, [started]);
+
+  const toggleLayer = useCallback((id) => {
+    if (!started) return;
+    setLayerState(prev => {
+      const cur = prev[id];
+      const synth = engine.synths[id];
+      if (!synth) return prev;
+
+      if (id === "thunder") {
+        if (!cur.active) {
+          synth.trigger();
+          // trigger doesn't stay "active" — it's a one-shot
+          return prev;
+        }
+        return prev;
+      }
+
+      if (cur.active) {
+        synth.stop();
+      } else {
+        synth.start();
+      }
+      return { ...prev, [id]: { ...cur, active: !cur.active } };
+    });
+  }, [started]);
+
   // ── MIDI / OSC ──────────────────────────────
   const midiRef   = useRef(null);
   const oscRef    = useRef(null);
+  const midiGateStateRef = useRef({});
   const [midiEnabled,  setMidiEnabled]  = useState(false);
   const [midiInputs,   setMidiInputs]   = useState([]);
+  const [midiBindings, setMidiBindings] = useState(() => loadMidiBindings());
+  const [midiLearnTarget, setMidiLearnTarget] = useState(null);
+  const [midiLearnStatus, setMidiLearnStatus] = useState("Custom mappings override the defaults below.");
+  const [midiLastMessage, setMidiLastMessage] = useState("Waiting for MIDI data.");
   const [oscStatus,    setOscStatus]    = useState("disconnected");
-  const [oscUrl,       setOscUrl]       = useState("ws://localhost:8080");
+  const [oscUrl,       setOscUrl]       = useState(() => loadStoredString(OSC_URL_STORAGE_KEY, "ws://localhost:8080"));
   const [showControl,  setShowControl]  = useState(false);
 
   // Unified CC handler — called by both MIDI and OSC
@@ -1647,6 +1882,13 @@ export default function Ambigram() {
     }
   }, [setLayerLevel, setParam]);
 
+  const handleOscParam = useCallback((layerId, paramId, value) => {
+    const paramDef = LAYER_PARAMS[layerId]?.find(p => p.id === paramId);
+    if (!paramDef) return;
+    const clamped = Math.max(paramDef.min, Math.min(paramDef.max, value));
+    setParam(layerId, paramId, clamped);
+  }, [setParam]);
+
   const handleLayerToggleExternal = useCallback((id, mode) => {
     const state = engine.synths[id];
     if (!state) return;
@@ -1655,28 +1897,176 @@ export default function Ambigram() {
     if (!mode) toggleLayer(id); // bare toggle (MIDI note)
   }, [toggleLayer]);
 
+  const applyLegacyMidiMapping = useCallback((event) => {
+    if (event.type === "cc") {
+      if (event.controller === 1 || event.controller === 7) return handleCC("masterVol", event.value01);
+      if (event.controller === 11) return handleCC("reverbMix", event.value01);
+      if (event.controller >= 20 && event.controller <= 31) {
+        return handleCC(`layer:${LAYER_ORDER[event.controller - 20]}`, event.value01);
+      }
+      if (event.controller >= 70 && event.controller <= 81) {
+        return handleCC(`param0:${LAYER_ORDER[event.controller - 70]}`, event.value01);
+      }
+      if (event.controller === 64) {
+        const isHigh = event.value >= 64;
+        const wasHigh = !!midiGateStateRef.current.legacyThunder;
+        midiGateStateRef.current.legacyThunder = isHigh;
+        if (isHigh && !wasHigh) triggerThunder();
+      }
+      return;
+    }
+
+    if (event.type === "noteon" && event.note >= 48 && event.note <= 59) {
+      handleLayerToggleExternal(LAYER_ORDER[event.note - 48]);
+    }
+  }, [handleCC, handleLayerToggleExternal, triggerThunder]);
+
+  const applyMidiAction = useCallback((actionKey, event) => {
+    if (event.type === "noteoff") return;
+
+    if (actionKey === "masterVol") {
+      handleCC("masterVol", event.type === "cc" ? event.value01 : 1);
+      return;
+    }
+
+    if (actionKey === "reverbMix") {
+      handleCC("reverbMix", event.type === "cc" ? event.value01 : 1);
+      return;
+    }
+
+    if (actionKey === "thunderStrike") {
+      if (event.type === "cc") {
+        const isHigh = event.value >= 64;
+        const wasHigh = !!midiGateStateRef.current[actionKey];
+        midiGateStateRef.current[actionKey] = isHigh;
+        if (isHigh && !wasHigh) triggerThunder();
+        return;
+      }
+      triggerThunder();
+      return;
+    }
+
+    if (actionKey.startsWith("layer:")) {
+      handleCC(actionKey, event.type === "cc" ? event.value01 : 1);
+    }
+  }, [handleCC, triggerThunder]);
+
+  const handleMidiMessage = useCallback((event) => {
+    setMidiLastMessage(formatMidiEvent(event));
+
+    if (midiLearnTarget) {
+      const learnedBinding = midiEventToBinding(event);
+      if (learnedBinding) {
+        setMidiBindings(prev => ({ ...prev, [midiLearnTarget]: learnedBinding }));
+        const target = MIDI_LEARN_TARGETS.find(item => item.key === midiLearnTarget);
+        setMidiLearnStatus(`${target?.label || midiLearnTarget} learned as ${describeMidiBinding(learnedBinding)}.`);
+        setMidiLearnTarget(null);
+      }
+      return;
+    }
+
+    const customAction = Object.entries(midiBindings).find(([, binding]) =>
+      midiBindingMatches(binding, event)
+    );
+
+    if (customAction) {
+      applyMidiAction(customAction[0], event);
+      return;
+    }
+
+    applyLegacyMidiMapping(event);
+  }, [applyLegacyMidiMapping, applyMidiAction, midiBindings, midiLearnTarget]);
+
   const initMIDI = useCallback(async () => {
     if (!midiRef.current) {
-      midiRef.current = new MIDIController(handleCC, handleLayerToggleExternal, triggerThunder);
+      midiRef.current = new MIDIController(handleMidiMessage);
     }
+    midiRef.current.onMessage = handleMidiMessage;
+    midiRef.current._onInputsChange = setMidiInputs;
     const ok = await midiRef.current.init();
     if (ok) {
       setMidiEnabled(true);
       setMidiInputs(midiRef.current.inputNames());
+      setMidiLearnStatus("MIDI ready. Use Learn on any control to map your fader box.");
     }
-  }, [handleCC, handleLayerToggleExternal, triggerThunder]);
+    return ok;
+  }, [handleMidiMessage]);
 
   const connectOSC = useCallback(() => {
     if (!oscRef.current) {
-      oscRef.current = new OSCController(handleCC, handleLayerToggleExternal, triggerThunder, oscUrl);
-      oscRef.current._onStatus = setOscStatus;
+      oscRef.current = new OSCController(
+        handleCC,
+        handleLayerToggleExternal,
+        triggerThunder,
+        handleOscParam,
+        oscUrl
+      );
     }
+    oscRef.current.onCC = handleCC;
+    oscRef.current.onLayerToggle = handleLayerToggleExternal;
+    oscRef.current.onThunder = triggerThunder;
+    oscRef.current.onParam = handleOscParam;
+    oscRef.current._onStatus = setOscStatus;
     oscRef.current.connect(oscUrl);
-  }, [handleCC, handleLayerToggleExternal, triggerThunder, oscUrl]);
+  }, [handleCC, handleLayerToggleExternal, handleOscParam, triggerThunder, oscUrl]);
 
   const disconnectOSC = useCallback(() => {
     oscRef.current?.disconnect();
   }, []);
+
+  const beginMidiLearn = useCallback(async (targetKey) => {
+    if (!midiEnabled) {
+      const ok = await initMIDI();
+      if (!ok) {
+        setMidiLearnStatus("MIDI could not be enabled in this browser.");
+        return;
+      }
+    }
+    const target = MIDI_LEARN_TARGETS.find(item => item.key === targetKey);
+    setMidiLearnTarget(targetKey);
+    setMidiLearnStatus(`Move a control now for ${target?.label || targetKey}.`);
+  }, [initMIDI, midiEnabled]);
+
+  const clearMidiBinding = useCallback((targetKey) => {
+    setMidiBindings(prev => {
+      const next = { ...prev };
+      delete next[targetKey];
+      return next;
+    });
+    if (midiLearnTarget === targetKey) setMidiLearnTarget(null);
+    setMidiLearnStatus(`${MIDI_LEARN_TARGETS.find(item => item.key === targetKey)?.label || targetKey} reset to its default mapping.`);
+  }, [midiLearnTarget]);
+
+  const resetMidiBindings = useCallback(() => {
+    setMidiBindings({});
+    setMidiLearnTarget(null);
+    setMidiLearnStatus("Custom MIDI mappings cleared. Legacy defaults are active again.");
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(MIDI_BINDINGS_STORAGE_KEY, JSON.stringify(midiBindings));
+  }, [midiBindings]);
+
+  useEffect(() => {
+    if (!midiRef.current) return;
+    midiRef.current.onMessage = handleMidiMessage;
+    midiRef.current._onInputsChange = setMidiInputs;
+  }, [handleMidiMessage]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(OSC_URL_STORAGE_KEY, oscUrl);
+  }, [oscUrl]);
+
+  useEffect(() => {
+    if (!oscRef.current) return;
+    oscRef.current.onCC = handleCC;
+    oscRef.current.onLayerToggle = handleLayerToggleExternal;
+    oscRef.current.onThunder = triggerThunder;
+    oscRef.current.onParam = handleOscParam;
+    oscRef.current._onStatus = setOscStatus;
+  }, [handleCC, handleLayerToggleExternal, handleOscParam, triggerThunder]);
 
   // ── EVOLUTION ───────────────────────────────
   const [evolveOn,       setEvolveOn]       = useState(false);
@@ -1708,7 +2098,13 @@ export default function Ambigram() {
   }, [evolveStrength, evolveOn]);
 
   // Cleanup on unmount
-  useEffect(() => () => { evolutionEngine.stop(); }, []);
+  useEffect(() => () => {
+    evolutionEngine.stop();
+    clearInterval(recTimerRef.current);
+    recorderRef.current?.destroy();
+    midiRef.current?.destroy();
+    oscRef.current?.disconnect();
+  }, []);
 
   const initAndStart = useCallback(async (sr = sampleRate) => {
     await engine.init(sr);
@@ -1773,45 +2169,8 @@ export default function Ambigram() {
     if (started) engine.setReverb(reverbMix);
   }, [reverbMix, started]);
 
-  const toggleLayer = useCallback((id) => {
-    if (!started) return;
-    setLayerState(prev => {
-      const cur = prev[id];
-      const synth = engine.synths[id];
-      if (!synth) return prev;
-
-      if (id === "thunder") {
-        if (!cur.active) {
-          synth.trigger();
-          // trigger doesn't stay "active" — it's a one-shot
-          return prev;
-        }
-        return prev;
-      }
-
-      if (cur.active) {
-        synth.stop();
-      } else {
-        synth.start();
-      }
-      return { ...prev, [id]: { ...cur, active: !cur.active } };
-    });
-  }, [started]);
-
-  const triggerThunder = useCallback(() => {
-    if (!started || !engine.synths.thunder) return;
-    engine.synths.thunder.trigger();
-  }, [started]);
-
-  const setLayerLevel = useCallback((id, val) => {
-    if (!started) return;
-    const synth = engine.synths[id];
-    if (synth && synth.setLevel) synth.setLevel(val);
-    setLayerState(prev => ({ ...prev, [id]: { ...prev[id], level: val } }));
-  }, [started]);
-
   const applyPreset = useCallback(async (name) => {
-    if (!started) await engine.init().then(() => setStarted(true));
+    if (!started) await initAndStart(sampleRate);
     const preset = PRESETS[name];
     if (!preset) return;
     setActivePreset(name);
@@ -1839,7 +2198,7 @@ export default function Ambigram() {
         return { ...prev, [id]: { active: shouldBeActive, level } };
       });
     });
-  }, [started]);
+  }, [initAndStart, sampleRate, started]);
 
   const stopAll = useCallback(() => {
     LAYERS.forEach(({ id }) => {
@@ -1999,20 +2358,62 @@ export default function Ambigram() {
           {/* MIDI */}
           <div style={styles.controlSection}>
             <div style={styles.controlTitle}>MIDI</div>
-            <button style={{ ...styles.ctrlBtn, borderColor: midiEnabled ? "#7dde92" : "#444",
-              color: midiEnabled ? "#7dde92" : "#888" }}
-              onClick={initMIDI}>
-              {midiEnabled ? "✓ Connected" : "Connect MIDI"}
-            </button>
-            {midiEnabled && midiInputs.length > 0 && (
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              <button style={{ ...styles.ctrlBtn, borderColor: midiEnabled ? "#7dde92" : "#444",
+                color: midiEnabled ? "#7dde92" : "#888" }}
+                onClick={initMIDI}>
+                {midiEnabled ? "✓ MIDI Ready" : "Enable MIDI"}
+              </button>
+              <button style={styles.ctrlBtn} onClick={resetMidiBindings}>
+                Reset Learn
+              </button>
+            </div>
+            <div style={styles.ctrlNote}>{midiLearnStatus}</div>
+            <div style={{ ...styles.ctrlNote, color: "#667c70" }}>{midiLastMessage}</div>
+            {midiEnabled && (
               <div style={styles.ctrlNote}>
-                {midiInputs.map((n,i) => <div key={i}>↳ {n}</div>)}
+                {midiInputs.length > 0
+                  ? midiInputs.map((n, i) => <div key={i}>↳ {n}</div>)
+                  : "No MIDI inputs detected yet."}
               </div>
             )}
+            <div style={styles.midiMapList}>
+              {MIDI_LEARN_TARGETS.map(target => {
+                const binding = midiBindings[target.key];
+                const isLearning = midiLearnTarget === target.key;
+                return (
+                  <div key={target.key} style={styles.midiMapRow}>
+                    <div style={styles.midiMapMeta}>
+                      <div style={styles.midiMapLabel}>{target.label}</div>
+                      <div style={styles.midiMapValue}>
+                        {binding ? describeMidiBinding(binding) : legacyMidiBindingLabel(target.key)}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button
+                        style={{
+                          ...styles.ctrlBtn,
+                          borderColor: isLearning ? "#ffd866" : "#3a4a3c",
+                          color: isLearning ? "#ffd866" : "#9bb09f",
+                          minWidth: 72,
+                        }}
+                        onClick={() => beginMidiLearn(target.key)}>
+                        {isLearning ? "Listening" : "Learn"}
+                      </button>
+                      {binding && (
+                        <button style={{ ...styles.ctrlBtn, minWidth: 54 }} onClick={() => clearMidiBinding(target.key)}>
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
             <div style={styles.ctrlNote}>
-              CC 1/7 → Vol · CC 11 → Reverb<br/>
-              CC 20-31 → Layer levels · CC 64 → Strike<br/>
-              Note C3-B3 → Toggle layers
+              Defaults stay active until you learn an override.
+              <br/>
+              Legacy toggle notes remain on C3-B3 and param-0 stays on CC 70-81.
             </div>
           </div>
 
@@ -2037,7 +2438,10 @@ export default function Ambigram() {
             </div>
             <div style={styles.ctrlNote}>
               /ambigram/master/volume f<br/>
+              /ambigram/master/reverb f<br/>
               /ambigram/layer/&lt;id&gt; f<br/>
+              /ambigram/layer/&lt;id&gt;/on i<br/>
+              /ambigram/param/&lt;id&gt;/&lt;paramId&gt; f<br/>
               /ambigram/thunder/strike i
             </div>
           </div>
@@ -2281,7 +2685,7 @@ const styles = {
     flexWrap: "wrap",
   },
   controlSection: {
-    display: "flex", flexDirection: "column", gap: 6, minWidth: 200,
+    display: "flex", flexDirection: "column", gap: 6, minWidth: 280, flex: 1,
   },
   controlTitle: {
     color: "#c084fc", fontSize: 10, letterSpacing: 3, marginBottom: 2,
@@ -2298,6 +2702,25 @@ const styles = {
     background: "#0a140c", border: "1px solid #2a3a2c", color: "#7dde92",
     borderRadius: 4, padding: "4px 8px", fontSize: 11,
     fontFamily: "'Courier New', monospace", flex: 1, outline: "none",
+  },
+  midiMapList: {
+    display: "flex", flexDirection: "column", gap: 8, marginTop: 4,
+    maxHeight: 320, overflowY: "auto", paddingRight: 4,
+  },
+  midiMapRow: {
+    display: "flex", justifyContent: "space-between", alignItems: "center",
+    gap: 10, padding: "8px 10px", borderRadius: 8,
+    background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)",
+  },
+  midiMapMeta: {
+    display: "flex", flexDirection: "column", gap: 3, minWidth: 0,
+  },
+  midiMapLabel: {
+    color: "#c7d3ca", fontSize: 11, letterSpacing: 0.6,
+  },
+  midiMapValue: {
+    color: "#6c8677", fontSize: 10, letterSpacing: 0.4,
+    whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
   },
 
   // ── Param panel styles ──────────────────────
