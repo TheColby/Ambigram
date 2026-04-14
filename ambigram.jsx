@@ -199,7 +199,8 @@ class AmbigramEngine {
 
   setReverb(mix) {
     if (!this.reverbSend) return;
-    this.reverbSend.gain.linearRampToValueAtTime(mix * 0.45, this.ctx.currentTime + 0.1);
+    // Max gain raised to 2.0 so the top of the reverb knob is very wet / room-filling
+    this.reverbSend.gain.linearRampToValueAtTime(mix * 2.0, this.ctx.currentTime + 0.1);
   }
 }
 
@@ -472,20 +473,28 @@ class WindSynth {
     this.lp2.frequency.value = 1200;
     this.lp1.connect(this.lp2); this.lp2.connect(this.gainNode);
 
-    // LFO for filter sweep (gusts)
+    // LFO for filter sweep (gusts) — very slow so wind doesn't "vibrate"
+    // 0.012 Hz ≈ one gust cycle every ~83 seconds; feels like real wind
     this.lfo = ctx.createOscillator(); this.lfo.type = "sine";
-    this.lfo.frequency.value = 0.08;
-    this.lfoGain = ctx.createGain(); this.lfoGain.gain.value = 500;
+    this.lfo.frequency.value = 0.012;
+    this.lfoGain = ctx.createGain(); this.lfoGain.gain.value = 400;
     this.lfo.connect(this.lfoGain); this.lfoGain.connect(this.lp1.frequency);
     this.lfo.start();
 
-    // Second slow LFO for amplitude swell
+    // Second LFO for amplitude swell — also very slow (0.008 Hz ≈ 125 s)
     this.ampLfo = ctx.createOscillator(); this.ampLfo.type = "sine";
-    this.ampLfo.frequency.value = 0.04;
+    this.ampLfo.frequency.value = 0.008;
     this.ampLfoGain = ctx.createGain(); this.ampLfoGain.gain.value = 0;
     this.ampLfo.connect(this.ampLfoGain);
     this.ampLfoGain.connect(this.gainNode.gain);
     this.ampLfo.start();
+
+    // Third very-slow LFO for subtle timbral variation (0.005 Hz ≈ 200 s)
+    this.lpLfo2 = ctx.createOscillator(); this.lpLfo2.type = "sine";
+    this.lpLfo2.frequency.value = 0.005;
+    this.lpLfo2Gain = ctx.createGain(); this.lpLfo2Gain.gain.value = 200;
+    this.lpLfo2.connect(this.lpLfo2Gain); this.lpLfo2Gain.connect(this.lp2.frequency);
+    this.lpLfo2.start();
 
     this._source = null;
   }
@@ -519,78 +528,166 @@ class WindSynth {
   }
 }
 
-// ─────────────────────────────────────────────
-//  THUNDER — low-frequency noise with modal resonators
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  THUNDER — four-layer synthesis: crack → bang → rolling rumble → echo tails
+//
+//  Architecture:
+//    _crack()  : sharp white-noise transient (close lightning only, dist < 0.5)
+//    _bang()   : initial compression wave — brown noise through low BP, 80–330 ms
+//    _rumble() : sustained low-frequency roar with rolling AM (0.3–1.5 Hz LFO)
+//    _echo()   : 1–3 low-passed reflections arriving 300–800 ms apart
+//
+//  ALL GainNodes are created with gain.value = 0 and brought up via scheduled
+//  ramps only — no setValueAtTime(nonZero) without a preceding zero — so there
+//  is no transient click regardless of timing jitter or AudioContext state.
+// ─────────────────────────────────────────────────────────────────────────────
 
 class ThunderSynth {
   constructor(ctx, dry, wet) {
-    this.ctx = ctx; this.level = 0.8;
-    this.dry = dry; this.wet = wet;
+    this.ctx = ctx; this.dry = dry; this.wet = wet;
+    this.level    = 0.8;
+    this.distance = 0.35; // 0 = close/sharp, 1 = distant/rolling
+    this.autoMin  = 8000;
+    this.autoMax  = 33000;
     this._autoTimer = null; this.autoMode = false;
   }
 
+  setLevel(v)    { this.level    = v; }
+  setDistance(v) { this.distance = v; }
+
   trigger() {
+    const ctx  = this.ctx;
+    const t    = ctx.currentTime + 0.15;  // 150 ms look-ahead
+    const dist = this.distance;
+    const lvl  = this.level;
+    // Rumble duration: close = shorter + more defined; distant = longer rolling
+    const dur  = 2.5 + (1 + dist * 5) * (0.6 + Math.random() * 0.8);
+
+    if (dist < 0.5)                       this._crack(t, dist, lvl);
+    this._bang(t + dist * 0.06, dist, lvl);
+    this._rumble(t + 0.04, dur, dist, lvl);
+    // 1–3 echo reflections; more when close (reflections are louder)
+    const nEchoes = 1 + Math.floor((1.1 - dist) * 2 + Math.random() * 1.5);
+    for (let i = 0; i < nEchoes; i++) {
+      this._echo(t + 0.28 + i * (0.22 + Math.random() * 0.45), i, dist, lvl);
+    }
+  }
+
+  // ── 1. Sharp crack: 15–30 ms burst of highpassed white noise
+  _crack(t, dist, lvl) {
+    const ctx      = this.ctx;
+    const dur      = 0.014 + Math.random() * 0.014;
+    const amp      = (0.55 - dist * 1.1) * lvl;
+    if (amp <= 0) return;
+
+    const buf = makeWhiteBuffer(ctx, dur + 0.01);
+    const src = ctx.createBufferSource(); src.buffer = buf;
+
+    const hp = ctx.createBiquadFilter();
+    hp.type = "highpass"; hp.frequency.value = 900 + Math.random() * 700;
+    const lp = ctx.createBiquadFilter();
+    lp.type = "lowpass";  lp.frequency.value = 9000;
+
+    const env = ctx.createGain(); env.gain.value = 0;
+    env.gain.setValueAtTime(0, t);
+    env.gain.linearRampToValueAtTime(amp, t + 0.001);
+    env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+    src.connect(hp); hp.connect(lp); lp.connect(env); env.connect(this.dry);
+    src.start(t); src.stop(t + dur + 0.01);
+  }
+
+  // ── 2. Initial compression wave: brown noise, two resonant BPs, fast decay
+  _bang(t, dist, lvl) {
+    const ctx    = this.ctx;
+    const dur    = 0.08 + (1 - dist) * 0.28;
+    const amp    = (0.72 - dist * 0.28) * lvl;
+
+    const buf = makeBrownBuffer(ctx, dur + 0.06);
+    const src = ctx.createBufferSource(); src.buffer = buf;
+
+    const bp1 = ctx.createBiquadFilter();
+    bp1.type = "bandpass"; bp1.frequency.value = 55 + Math.random() * 55; bp1.Q.value = 1.8;
+    const bp2 = ctx.createBiquadFilter();
+    bp2.type = "bandpass"; bp2.frequency.value = 130 + Math.random() * 100; bp2.Q.value = 2.5;
+    const g2 = ctx.createGain(); g2.gain.value = 0.45;
+
+    const env = ctx.createGain(); env.gain.value = 0;
+    env.gain.setValueAtTime(0, t);
+    env.gain.linearRampToValueAtTime(amp, t + 0.016);
+    env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+    src.connect(bp1); bp1.connect(env);
+    src.connect(bp2); bp2.connect(g2); g2.connect(env);
+    env.connect(this.dry); env.connect(this.wet);
+    src.start(t); src.stop(t + dur + 0.06);
+  }
+
+  // ── 3. Rolling rumble: modal resonators + slow AM for the "rolling" texture
+  _rumble(t, dur, dist, lvl) {
     const ctx = this.ctx;
-    // Start well ahead of currentTime so all param scheduling is deterministic
-    const t   = ctx.currentTime + 0.05;
-    const dur = 3.5 + Math.random() * 4;
+    const buf = makeBrownBuffer(ctx, dur + 1.5);
+    const src = ctx.createBufferSource(); src.buffer = buf;
 
-    // ── Rumble — pre-faded noise buffer (fade-in baked into sample data)
-    // This avoids ALL gain scheduling on the rumble path and eliminates
-    // the click that happens when a non-zero sample suddenly appears.
-    const fadeMs = 120; // ms of sample-level fade-in
-    const fadeSamples = Math.round(ctx.sampleRate * fadeMs / 1000);
-    const rumbleBuf  = makeBrownBuffer(ctx, Math.ceil(dur) + 1);
-    const rumbleData = rumbleBuf.getChannelData(0);
-    for (let i = 0; i < fadeSamples && i < rumbleData.length; i++) {
-      rumbleData[i] *= i / fadeSamples; // linear fade-in in sample domain
-    }
-
-    const src = ctx.createBufferSource(); src.buffer = rumbleBuf;
-
-    const resonances = [48, 72, 96, 140, 210].map(freq => {
+    // Modal resonators at thunderclap frequencies
+    const modes = [28, 45, 68, 95, 138].map((freq, i) => {
       const bp = ctx.createBiquadFilter();
-      bp.type = "bandpass"; bp.frequency.value = freq;
-      bp.Q.value = 3 + Math.random() * 4;
-      return bp;
+      bp.type = "bandpass";
+      bp.frequency.value = freq * (0.88 + 0.24 * Math.random());
+      bp.Q.value = 2 + Math.random() * 3.5;
+      const mg = ctx.createGain(); mg.gain.value = 0.6 - i * 0.1;
+      src.connect(bp); bp.connect(mg);
+      return mg;
     });
 
-    const master = ctx.createGain();
-    master.gain.setValueAtTime(0.55 * this.level, t); // constant — no ramp needed
-    master.gain.setValueAtTime(0.55 * this.level, t + 0.5);
-    master.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-    master.connect(this.dry); master.connect(this.wet);
+    // Rolling AM: oscillates between 0.6 and 1.0 at 0.3–1.5 Hz
+    const amRate  = 0.3 + Math.random() * 1.2;
+    const amOsc   = ctx.createOscillator(); amOsc.type = "sine";
+    amOsc.frequency.value = amRate;
+    const amDepth = ctx.createGain(); amDepth.gain.value = 0.2;  // ±0.2
+    const rollG   = ctx.createGain(); rollG.gain.value = 0.8;    // DC = 0.8
+    amOsc.connect(amDepth); amDepth.connect(rollG.gain);          // net: 0.6–1.0
 
-    resonances.forEach(bp => {
-      const g = ctx.createGain(); g.gain.value = 0.7;
-      src.connect(bp); bp.connect(g); g.connect(master);
-    });
+    // Outer envelope — fade in then long slow decay
+    const amp    = (0.45 + (1 - dist) * 0.35) * lvl;
+    const envG   = ctx.createGain(); envG.gain.value = 0;
+    envG.gain.setValueAtTime(0, t);
+    envG.gain.linearRampToValueAtTime(amp, t + 0.35);
+    // Mid-rumble swell ±15%
+    const swell  = amp * (0.85 + Math.random() * 0.30);
+    envG.gain.linearRampToValueAtTime(swell, t + dur * 0.35);
+    envG.gain.exponentialRampToValueAtTime(0.0001, t + dur);
 
-    // ── Crack — similarly pre-faded in sample domain
-    const crackBuf  = makeWhiteBuffer(ctx, 0.25);
-    const crackData = crackBuf.getChannelData(0);
-    const crackFade = Math.round(ctx.sampleRate * 0.006); // 6ms
-    for (let i = 0; i < crackFade && i < crackData.length; i++) {
-      crackData[i] *= i / crackFade;
-    }
-    // Also apply the amplitude envelope in sample domain
-    const crackTotal = crackData.length;
-    for (let i = 0; i < crackTotal; i++) {
-      const env = Math.pow(1 - i / crackTotal, 1.8); // exponential decay shape
-      crackData[i] *= env * 0.65 * this.level;
-    }
+    modes.forEach(mg => mg.connect(rollG));
+    rollG.connect(envG);
+    envG.connect(this.dry); envG.connect(this.wet);
 
-    const crack   = ctx.createBufferSource(); crack.buffer = crackBuf;
-    const crackHp = ctx.createBiquadFilter();
-    crackHp.type = "highpass"; crackHp.frequency.value = 180;
-    const crackLp = ctx.createBiquadFilter();
-    crackLp.type = "lowpass";  crackLp.frequency.value = 7000;
-    // No gain node on crack path — envelope is baked into the buffer
-    crack.connect(crackHp); crackHp.connect(crackLp); crackLp.connect(this.dry);
-    crack.start(t); crack.stop(t + 0.26);
+    amOsc.start(t); amOsc.stop(t + dur + 1.5);
+    src.start(t);   src.stop(t + dur + 1.5);
+  }
 
-    src.start(t); src.stop(t + dur + 0.1);
+  // ── 4. Echo reflections: each increasingly low-passed and quieter
+  _echo(t, idx, dist, lvl) {
+    const ctx    = this.ctx;
+    const dur    = 0.12 + Math.random() * 0.22;
+    const amp    = lvl * 0.22 * Math.pow(0.5, idx) * (0.4 + dist * 0.6);
+
+    const buf = makeBrownBuffer(ctx, dur + 0.06);
+    const src = ctx.createBufferSource(); src.buffer = buf;
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = "lowpass"; lp.frequency.value = Math.max(80, 280 - idx * 70);
+    const bp = ctx.createBiquadFilter();
+    bp.type = "bandpass"; bp.frequency.value = 45 + Math.random() * 40; bp.Q.value = 2.5;
+
+    const env = ctx.createGain(); env.gain.value = 0;
+    env.gain.setValueAtTime(0, t);
+    env.gain.linearRampToValueAtTime(amp, t + 0.022);
+    env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+    src.connect(bp); bp.connect(lp); lp.connect(env);
+    env.connect(this.dry); env.connect(this.wet);
+    src.start(t); src.stop(t + dur + 0.06);
   }
 
   setAutoMode(on) {
@@ -600,11 +697,9 @@ class ThunderSynth {
 
   _scheduleAuto() {
     if (!this.autoMode) return;
-    const delay = 8000 + Math.random() * 25000;
+    const delay = (this.autoMin || 8000) + Math.random() * ((this.autoMax || 33000) - (this.autoMin || 8000));
     this._autoTimer = setTimeout(() => { this.trigger(); this._scheduleAuto(); }, delay);
   }
-
-  setLevel(v) { this.level = v; }
 }
 
 // ─────────────────────────────────────────────
@@ -806,11 +901,56 @@ class CricketSynth {
 //  FROGS — Everglades-style resonant croaks (FM + bandpass)
 // ─────────────────────────────────────────────
 
-const FROG_TYPES = [
-  { f: 600,  mr: 3.5, md: 280, dur: 0.18, reps: 2 },  // barking treefrog
-  { f: 420,  mr: 2.0, md: 180, dur: 0.35, reps: 1 },  // bullfrog
-  { f: 850,  mr: 4.2, md: 340, dur: 0.12, reps: 5 },  // green treefrog
-  { f: 1100, mr: 5.0, md: 500, dur: 0.08, reps: 8 },  // chorus frog
+// ─────────────────────────────────────────────
+//  FROG SPECIES — each has a distinct synthesis type
+//   "harmonic"       — stacked sine harmonics through formant BP (bullfrog)
+//   "pulsed"         — rapid individual pulse events = trill (green treefrog, chorus frog)
+//   "pure"           — single sine with vibrato (spring peeper)
+//   "noise_resonant" — white noise through sharp BP = bark (barking treefrog)
+// ─────────────────────────────────────────────
+const FROG_SPECIES = [
+  {
+    name: "bullfrog",        type: "harmonic",
+    pitchLo: 90,  pitchHi: 150,
+    harmAmps: [1.0, 0.52, 0.27, 0.11],   // f0, f0×2, f0×3, f0×4
+    formantF: 175, formantQ: 7,
+    attack: 0.04, decay: 0.4, release: 0.55,
+    noise: 0.12,
+    burstMin: 1, burstMax: 1, burstGap: 0,
+  },
+  {
+    name: "green_treefrog",  type: "pulsed",
+    pitchLo: 860, pitchHi: 1100,
+    fmRatio: 1.22, fmDepth: 55,
+    pulseDur: 0.024, pulseGap: 0.016,
+    pulseMin: 3,  pulseMax: 7,
+    formantF: 970, formantQ: 5,
+    attack: 0.006, release: 0.015,
+    noise: 0.07,
+  },
+  {
+    name: "spring_peeper",   type: "pure",
+    pitchLo: 2700, pitchHi: 3100,
+    attack: 0.009, decay: 0.09, release: 0.18,
+    noise: 0.02,
+  },
+  {
+    name: "barking_treefrog", type: "noise_resonant",
+    pitchLo: 480, pitchHi: 630,
+    noiseQ: 20,
+    attack: 0.01, release: 0.12,
+    burstMin: 2, burstMax: 4, burstGap: 0.22,
+  },
+  {
+    name: "chorus_frog",     type: "pulsed",
+    pitchLo: 1080, pitchHi: 1350,
+    fmRatio: 1.48, fmDepth: 92,
+    pulseDur: 0.009, pulseGap: 0.007,
+    pulseMin: 12, pulseMax: 22,
+    formantF: 1200, formantQ: 4,
+    attack: 0.003, release: 0.007,
+    noise: 0.17,
+  },
 ];
 
 class FrogSynth {
@@ -823,7 +963,7 @@ class FrogSynth {
 
   start() {
     if (this.active) return; this.active = true;
-    this.gainNode.gain.linearRampToValueAtTime(0.15 + 0.3 * this.level, this.ctx.currentTime + 1);
+    this.gainNode.gain.linearRampToValueAtTime(1.0, this.ctx.currentTime + 1);
     this._scheduleFrog();
   }
 
@@ -836,49 +976,142 @@ class FrogSynth {
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(0.12 + 0.33 * v, this.ctx.currentTime + 0.2);
+      this.gainNode.gain.linearRampToValueAtTime(1.0, this.ctx.currentTime + 0.2);
   }
 
   _scheduleFrog() {
     if (!this.active) return;
-    const delay = 600 + Math.random() * (4000 / (this.level + 0.3));
+    const delay = 400 + Math.random() * (3500 / (this.level + 0.4));
     const t = setTimeout(() => { if (this.active) { this._croak(); this._scheduleFrog(); } }, delay);
     this._timers.push(t);
   }
 
   _croak() {
-    const ft = FROG_TYPES[Math.floor(Math.random() * FROG_TYPES.length)];
-    const ctx = this.ctx; const pitchM = 0.88 + Math.random() * 0.24;
+    const sp  = FROG_SPECIES[Math.floor(Math.random() * FROG_SPECIES.length)];
+    const t0  = this.ctx.currentTime + 0.06;
+    const pitch = sp.pitchLo + Math.random() * (sp.pitchHi - sp.pitchLo);
+    const lvl = 0.07 + 0.17 * this.level;
 
-    for (let i = 0; i < ft.reps; i++) {
-      const t0 = ctx.currentTime + i * (ft.dur * 1.4) + Math.random() * 0.015;
-      const carrier = ctx.createOscillator(); carrier.type = "sine";
-      carrier.frequency.value = ft.f * pitchM;
-      // pitch glide downward
-      carrier.frequency.linearRampToValueAtTime(ft.f * pitchM * 0.92, t0 + ft.dur);
+    if      (sp.type === "harmonic")       this._synthHarmonic(sp, t0, pitch, lvl);
+    else if (sp.type === "pulsed")         this._synthPulsed(sp, t0, pitch, lvl);
+    else if (sp.type === "pure")           this._synthPure(sp, t0, pitch, lvl);
+    else if (sp.type === "noise_resonant") {
+      const reps = sp.burstMin + Math.floor(Math.random() * (sp.burstMax - sp.burstMin + 1));
+      for (let r = 0; r < reps; r++)
+        this._synthNoiseResonant(sp, t0 + r * (sp.attack + sp.release + sp.burstGap), pitch, lvl);
+    }
+  }
 
-      const mod = ctx.createOscillator(); mod.type = "sine";
-      mod.frequency.value = ft.f * pitchM * ft.mr;
-      const modG = ctx.createGain(); modG.gain.value = ft.md;
-      mod.connect(modG); modG.connect(carrier.frequency);
-
+  // ── Harmonic stack: multiple sine partials → formant filter (bullfrog)
+  _synthHarmonic(sp, t0, pitch, lvl) {
+    const ctx = this.ctx;
+    const dur = sp.attack + sp.decay + sp.release;
+    sp.harmAmps.forEach((amp, i) => {
+      const osc = ctx.createOscillator(); osc.type = "sine";
+      osc.frequency.value = pitch * (i + 1);
       const env = ctx.createGain(); env.gain.value = 0;
       env.gain.setValueAtTime(0, t0);
-      env.gain.linearRampToValueAtTime(0.18 * this.level, t0 + 0.015);
-      env.gain.exponentialRampToValueAtTime(0.0001, t0 + ft.dur);
+      env.gain.linearRampToValueAtTime(lvl * amp, t0 + sp.attack);
+      env.gain.setValueAtTime(lvl * amp * 0.85, t0 + sp.attack + sp.decay * 0.5);
+      env.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      const bp = ctx.createBiquadFilter();
+      bp.type = "bandpass";
+      bp.frequency.value = sp.formantF * (0.9 + 0.2 * Math.random());
+      bp.Q.value = sp.formantQ;
+      osc.connect(env); env.connect(bp); bp.connect(this.gainNode);
+      osc.start(t0); osc.stop(t0 + dur + 0.06);
+    });
+    this._addNoise(sp.noise, t0, dur, pitch * 0.6, 2.5, lvl * 0.35);
+  }
 
-      // Body resonator
-      const bp = ctx.createBiquadFilter(); bp.type = "bandpass";
-      bp.frequency.value = ft.f * 0.7; bp.Q.value = 6;
-      const bpG = ctx.createGain(); bpG.gain.value = 0.5;
-
-      carrier.connect(env); carrier.connect(bp);
-      bp.connect(bpG); bpG.connect(this.gainNode);
-      env.connect(this.gainNode);
-
-      carrier.start(t0); mod.start(t0);
-      carrier.stop(t0 + ft.dur + 0.02); mod.stop(t0 + ft.dur + 0.02);
+  // ── Pulse train: one oscillator node per pulse = authentic trill texture
+  _synthPulsed(sp, t0, pitch, lvl) {
+    const ctx = this.ctx;
+    const n = sp.pulseMin + Math.floor(Math.random() * (sp.pulseMax - sp.pulseMin + 1));
+    const step = sp.pulseDur + sp.pulseGap;
+    for (let i = 0; i < n; i++) {
+      const pt  = t0 + i * step;
+      const osc = ctx.createOscillator(); osc.type = "sine";
+      osc.frequency.value = pitch * (1 + (Math.random() - 0.5) * 0.018);
+      if (sp.fmDepth) {
+        const fmOsc = ctx.createOscillator(); fmOsc.type = "sine";
+        fmOsc.frequency.value = pitch * sp.fmRatio;
+        const fmG = ctx.createGain();
+        fmG.gain.value = sp.fmDepth * (0.8 + 0.4 * Math.random());
+        fmOsc.connect(fmG); fmG.connect(osc.frequency);
+        fmOsc.start(pt); fmOsc.stop(pt + sp.pulseDur + 0.012);
+      }
+      const env = ctx.createGain(); env.gain.value = 0;
+      env.gain.setValueAtTime(0, pt);
+      env.gain.linearRampToValueAtTime(lvl, pt + sp.attack);
+      env.gain.setValueAtTime(lvl, pt + sp.pulseDur - sp.release * 0.4);
+      env.gain.linearRampToValueAtTime(0, pt + sp.pulseDur + sp.release);
+      if (sp.formantF) {
+        const bp = ctx.createBiquadFilter();
+        bp.type = "bandpass"; bp.frequency.value = sp.formantF; bp.Q.value = sp.formantQ;
+        osc.connect(env); env.connect(bp); bp.connect(this.gainNode);
+      } else {
+        osc.connect(env); env.connect(this.gainNode);
+      }
+      osc.start(pt); osc.stop(pt + sp.pulseDur + sp.release + 0.012);
     }
+    if (sp.noise > 0)
+      this._addNoise(sp.noise, t0, n * step + sp.release, pitch * 0.7, 3, lvl * 0.45);
+  }
+
+  // ── Pure tone with vibrato (spring peeper)
+  _synthPure(sp, t0, pitch, lvl) {
+    const ctx = this.ctx;
+    const dur = sp.attack + sp.decay + sp.release;
+    const osc = ctx.createOscillator(); osc.type = "sine";
+    osc.frequency.setValueAtTime(pitch, t0);
+    osc.frequency.linearRampToValueAtTime(pitch * 1.018, t0 + sp.attack);
+    osc.frequency.linearRampToValueAtTime(pitch * 0.988, t0 + sp.attack + sp.decay);
+    const env = ctx.createGain(); env.gain.value = 0;
+    env.gain.setValueAtTime(0, t0);
+    env.gain.linearRampToValueAtTime(lvl * 0.9, t0 + sp.attack);
+    env.gain.setValueAtTime(lvl * 0.82, t0 + sp.attack + sp.decay * 0.5);
+    env.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(env); env.connect(this.gainNode);
+    osc.start(t0); osc.stop(t0 + dur + 0.05);
+    if (sp.noise > 0) this._addNoise(sp.noise, t0, dur, pitch * 0.8, 4, lvl * 0.18);
+  }
+
+  // ── Noise through sharp resonant BP = "bark" / rasp (barking treefrog)
+  _synthNoiseResonant(sp, t0, pitch, lvl) {
+    const ctx = this.ctx;
+    const dur = sp.attack + sp.release;
+    const buf = makeWhiteBuffer(ctx, dur + 0.06);
+    const src = ctx.createBufferSource(); src.buffer = buf;
+    const bp1 = ctx.createBiquadFilter();
+    bp1.type = "bandpass"; bp1.frequency.value = pitch; bp1.Q.value = sp.noiseQ;
+    const bp2 = ctx.createBiquadFilter();
+    bp2.type = "bandpass"; bp2.frequency.value = pitch * 1.7; bp2.Q.value = sp.noiseQ * 0.5;
+    const bp2g = ctx.createGain(); bp2g.gain.value = 0.28;
+    const env = ctx.createGain(); env.gain.value = 0;
+    env.gain.setValueAtTime(0, t0);
+    env.gain.linearRampToValueAtTime(lvl * 1.6, t0 + sp.attack);
+    env.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    src.connect(bp1); bp1.connect(env);
+    src.connect(bp2); bp2.connect(bp2g); bp2g.connect(env);
+    env.connect(this.gainNode);
+    src.start(t0); src.stop(t0 + dur + 0.06);
+  }
+
+  // ── Shared breathiness helper: filtered noise blended under tonal call
+  _addNoise(amount, t0, dur, bpFreq, Q, lvl) {
+    if (amount <= 0) return;
+    const ctx = this.ctx;
+    const buf = makeWhiteBuffer(ctx, dur + 0.06);
+    const src = ctx.createBufferSource(); src.buffer = buf;
+    const bp  = ctx.createBiquadFilter();
+    bp.type = "bandpass"; bp.frequency.value = bpFreq; bp.Q.value = Q;
+    const g = ctx.createGain(); g.gain.value = 0;
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(lvl * amount, t0 + 0.015);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur + 0.02);
+    src.connect(bp); bp.connect(g); g.connect(this.gainNode);
+    src.start(t0); src.stop(t0 + dur + 0.08);
   }
 }
 
@@ -1191,11 +1424,13 @@ const LAYER_PARAMS = {
       apply: (s, v) => s.ampLfo && (s.ampLfo.frequency.value = v) },
   ],
   thunder: [
-    { id: "level",     label: "Strike Vol",   min: 0,    max: 1,    step: 0.01, default: 0.8, unit: "",
-      apply: (s, v) => (s.level = v) },
-    { id: "autoMin",   label: "Auto Min (s)", min: 4,    max: 60,   step: 1,    default: 8,   unit: "s",
+    { id: "level",     label: "Strike Vol",   min: 0,    max: 1,    step: 0.01, default: 0.8,  unit: "",
+      apply: (s, v) => s.setLevel(v) },
+    { id: "distance",  label: "Distance",     min: 0,    max: 1,    step: 0.01, default: 0.35, unit: "",
+      apply: (s, v) => s.setDistance(v) },
+    { id: "autoMin",   label: "Auto Min",     min: 4,    max: 60,   step: 1,    default: 8,    unit: "s",
       apply: (s, v) => (s.autoMin = v * 1000) },
-    { id: "autoMax",   label: "Auto Max (s)", min: 10,   max: 120,  step: 1,    default: 33,  unit: "s",
+    { id: "autoMax",   label: "Auto Max",     min: 10,   max: 120,  step: 1,    default: 33,   unit: "s",
       apply: (s, v) => (s.autoMax = v * 1000) },
   ],
   birds: [
@@ -1750,6 +1985,70 @@ const SAMPLE_RATES = [44100, 48000, 88200, 96000, 192000];
 const BIT_DEPTHS   = [16, 24, 32];
 
 const engine = new AmbigramEngine();
+
+// ─────────────────────────────────────────────
+//  VerticalFader — cross-browser custom drag slider
+//  Works identically in Chrome, Firefox, Safari, and on touch.
+//  value: 0–1  onChange: (newValue) => void
+// ─────────────────────────────────────────────
+function VerticalFader({ value, onChange, color, height = 80 }) {
+  const trackRef = useRef(null);
+  const dragging = useRef(false);
+
+  const valueFromY = (clientY) => {
+    const rect = trackRef.current.getBoundingClientRect();
+    return Math.max(0, Math.min(1, 1 - (clientY - rect.top) / rect.height));
+  };
+
+  const onMouseDown = (e) => {
+    e.preventDefault();
+    dragging.current = true;
+    onChange(valueFromY(e.clientY));
+    const move = (e) => { if (dragging.current) onChange(valueFromY(e.clientY)); };
+    const up   = ()  => { dragging.current = false; window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
+
+  const onTouchStart = (e) => {
+    e.preventDefault();
+    onChange(valueFromY(e.touches[0].clientY));
+    const move = (e) => onChange(valueFromY(e.touches[0].clientY));
+    const end  = ()  => { window.removeEventListener("touchmove", move); window.removeEventListener("touchend", end); };
+    window.addEventListener("touchmove", move, { passive: false });
+    window.addEventListener("touchend", end);
+  };
+
+  const pct = `${value * 100}%`;
+  return (
+    <div ref={trackRef}
+      style={{ width: 22, height, position: "relative", cursor: "ns-resize", flexShrink: 0, userSelect: "none" }}
+      onMouseDown={onMouseDown}
+      onTouchStart={onTouchStart}>
+      {/* Track groove */}
+      <div style={{
+        position: "absolute", left: "50%", transform: "translateX(-50%)",
+        width: 4, height: "100%", background: "#1a2a1c", borderRadius: 2,
+      }} />
+      {/* Filled portion (bottom to thumb) */}
+      <div style={{
+        position: "absolute", left: "50%", transform: "translateX(-50%)",
+        width: 4, bottom: 0, height: pct,
+        background: color + "88", borderRadius: 2,
+        transition: "height 0.05s linear",
+      }} />
+      {/* Thumb */}
+      <div style={{
+        position: "absolute", left: "50%", transform: "translateX(-50%)",
+        width: 16, height: 7,
+        bottom: `calc(${pct} - 3px)`,
+        background: color, borderRadius: 3,
+        boxShadow: `0 0 6px ${color}88`,
+        transition: "bottom 0.05s linear",
+      }} />
+    </div>
+  );
+}
 
 export default function Ambigram() {
   const [started, setStarted] = useState(false);
@@ -2485,15 +2784,12 @@ export default function Ambigram() {
                       <div style={{ ...styles.dot, background: isOn ? layer.color : "#333" }} />
 
                       {!isThunder && (
-                        <div style={styles.faderWrap}>
-                          <div style={styles.faderTrack}>
-                            <div style={{ ...styles.faderFill, height: `${state.level * 100}%`, background: layer.color }} />
-                          </div>
-                          <input type="range" min={0} max={1} step={0.01}
-                            value={state.level} orient="vertical"
-                            style={styles.faderInput}
-                            onChange={e => setLayerLevel(layer.id, +e.target.value)} />
-                        </div>
+                        <VerticalFader
+                          value={state.level}
+                          onChange={v => setLayerLevel(layer.id, v)}
+                          color={layer.color}
+                          height={80}
+                        />
                       )}
 
                       {isThunder ? (
@@ -2532,22 +2828,45 @@ export default function Ambigram() {
                     {/* Right column: param sliders (visible when expanded) */}
                     {expanded && params.length > 0 && (
                       <div style={styles.paramPanel}>
-                        {params.map(p => (
-                          <div key={p.id} style={styles.paramRow}>
-                            <label style={{ ...styles.paramLabel, color: layer.color + "cc" }}>
-                              {p.label}
-                            </label>
-                            <input type="range" min={p.min} max={p.max} step={p.step}
-                              value={pState[p.id] ?? p.default}
-                              style={{ ...styles.paramSlider, accentColor: layer.color }}
-                              onChange={e => setParam(layer.id, p.id, +e.target.value)} />
-                            <span style={styles.paramVal}>
-                              {(pState[p.id] ?? p.default).toFixed(
-                                p.step < 1 ? (p.step < 0.01 ? 3 : 2) : 0
-                              )}{p.unit}
-                            </span>
-                          </div>
-                        ))}
+                        {params.map(p => {
+                          const cur = pState[p.id] ?? p.default;
+                          const decimals = p.step < 1 ? (p.step < 0.01 ? 3 : 2) : 0;
+                          return (
+                            <div key={p.id} style={styles.paramRow}>
+                              {/* Top row: label on left, editable value on right */}
+                              <div style={styles.paramTopRow}>
+                                <span style={{ ...styles.paramLabel, color: layer.color + "cc" }}>
+                                  {p.label}
+                                </span>
+                                <div style={styles.paramValWrap}>
+                                  <input
+                                    type="number"
+                                    min={p.min} max={p.max} step={p.step}
+                                    value={cur.toFixed(decimals)}
+                                    style={{ ...styles.paramNumInput, borderColor: layer.color + "55", color: layer.color }}
+                                    onChange={e => {
+                                      const v = parseFloat(e.target.value);
+                                      if (!isNaN(v)) setParam(layer.id, p.id, Math.min(p.max, Math.max(p.min, v)));
+                                    }}
+                                    onKeyDown={e => {
+                                      if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+                                        e.preventDefault();
+                                        const delta = (e.key === "ArrowUp" ? 1 : -1) * p.step * (e.shiftKey ? 10 : 1);
+                                        setParam(layer.id, p.id, Math.min(p.max, Math.max(p.min, cur + delta)));
+                                      }
+                                    }}
+                                  />
+                                  <span style={styles.paramUnit}>{p.unit}</span>
+                                </div>
+                              </div>
+                              {/* Full-width slider on its own row */}
+                              <input type="range" min={p.min} max={p.max} step={p.step}
+                                value={cur}
+                                style={{ ...styles.paramSlider, accentColor: layer.color }}
+                                onChange={e => setParam(layer.id, p.id, +e.target.value)} />
+                            </div>
+                          );
+                        })}
                       </div>
                     )}
                   </div>
@@ -2654,19 +2973,6 @@ const styles = {
   cardLabel: { fontSize: 11, letterSpacing: 1, textAlign: "center", transition: "color 0.3s" },
   dot: { width: 6, height: 6, borderRadius: "50%", transition: "background 0.3s" },
 
-  faderWrap: { position: "relative", width: 30, height: 80 },
-  faderTrack: {
-    position: "absolute", left: "50%", transform: "translateX(-50%)",
-    width: 4, height: "100%", background: "#1a2a1c", borderRadius: 2,
-    display: "flex", flexDirection: "column", justifyContent: "flex-end",
-  },
-  faderFill: { width: "100%", borderRadius: 2, transition: "height 0.1s" },
-  faderInput: {
-    position: "absolute", top: 0, left: "50%", transform: "translateX(-50%)",
-    width: 80, height: 30, opacity: 0, cursor: "pointer",
-    writingMode: "vertical-lr",
-  },
-
   toggleBtn: {
     border: "1px solid #444", borderRadius: 6, padding: "5px 10px",
     cursor: "pointer", fontSize: 11, fontFamily: "inherit", letterSpacing: 1,
@@ -2735,18 +3041,34 @@ const styles = {
     minWidth: 0,
   },
   paramRow: {
-    display: "flex", alignItems: "center", gap: 6,
+    display: "flex", flexDirection: "column", gap: 3,
+  },
+  paramTopRow: {
+    display: "flex", justifyContent: "space-between", alignItems: "center",
   },
   paramLabel: {
-    fontSize: 9, letterSpacing: 0.5, width: 76, flexShrink: 0,
+    fontSize: 9, letterSpacing: 0.5, flexShrink: 0,
     whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+    maxWidth: "55%",
+  },
+  paramValWrap: {
+    display: "flex", alignItems: "center", gap: 2,
+  },
+  paramNumInput: {
+    width: 46, background: "#0a1510", border: "1px solid #2a4a34",
+    color: "#9ddeaa", borderRadius: 3, padding: "1px 4px",
+    fontSize: 9, fontFamily: "'Courier New', monospace",
+    textAlign: "right", outline: "none",
+    // hide browser spin arrows
+    MozAppearance: "textfield",
+  },
+  paramUnit: {
+    fontSize: 9, color: "#556", flexShrink: 0,
+    fontVariantNumeric: "tabular-nums",
   },
   paramSlider: {
-    flex: 1, height: 2, cursor: "pointer", minWidth: 0,
-  },
-  paramVal: {
-    fontSize: 9, color: "#556", width: 38, textAlign: "right", flexShrink: 0,
-    fontVariantNumeric: "tabular-nums",
+    width: "100%", height: 4, cursor: "pointer",
+    accentColor: "#7dde92",
   },
 
   // ── Format / record styles ──────────────────
