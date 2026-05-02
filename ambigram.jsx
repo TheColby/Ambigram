@@ -119,42 +119,104 @@ function karplusStrong(ctx, freq, decay = 0.995, durationSec = 1.5) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SURROUND FORMATS — speaker azimuth positions (0° = front-centre, CW positive)
-//  Channel order follows ITU-R BS.775 / Dolby 5.1 / 7.1 convention so that
-//  browsers and most audio interfaces honour the mapping correctly.
+//  SURROUND FORMATS — speaker positions in azimuth/elevation degrees
+//  (0° azimuth = front-centre, CW positive; elevation 0° = ear level).
+//  Channel order follows ITU-R / Dolby-style bed ordering where possible.
+//  For 7.2.4 we duplicate the LFE feed to two channels; WAVE metadata can only
+//  describe one standard LFE bit, so the second sub remains intentionally
+//  unspecified in the channel mask.
 // ─────────────────────────────────────────────────────────────────────────────
 const SURROUND_FORMATS = {
   stereo: {
     key: "stereo", label: "Stereo", channels: 2,
+    channelMask: 0x00000003,
     speakers: [
-      { name: "L",   az:  -30, lfe: false },
-      { name: "R",   az:   30, lfe: false },
+      { name: "L",   az:  -30, el: 0, lfe: false },
+      { name: "R",   az:   30, el: 0, lfe: false },
     ],
   },
   "5.1": {
     key: "5.1", label: "5.1", channels: 6,
+    channelMask: 0x0000003F,
     // ch0=L ch1=R ch2=C ch3=LFE ch4=Ls ch5=Rs
     speakers: [
-      { name: "L",   az:  -30, lfe: false },
-      { name: "R",   az:   30, lfe: false },
-      { name: "C",   az:    0, lfe: false },
-      { name: "LFE", az:    0, lfe: true  },
-      { name: "Ls",  az: -110, lfe: false },
-      { name: "Rs",  az:  110, lfe: false },
+      { name: "L",   az:  -30, el: 0, lfe: false },
+      { name: "R",   az:   30, el: 0, lfe: false },
+      { name: "C",   az:    0, el: 0, lfe: false },
+      { name: "LFE", az:    0, el: 0, lfe: true  },
+      { name: "Ls",  az: -110, el: 0, lfe: false },
+      { name: "Rs",  az:  110, el: 0, lfe: false },
     ],
   },
   "7.1": {
     key: "7.1", label: "7.1", channels: 8,
+    channelMask: 0x0000063F,
     // ch0=L ch1=R ch2=C ch3=LFE ch4=Ls ch5=Rs ch6=Lrs ch7=Rrs
     speakers: [
-      { name: "L",   az:  -30, lfe: false },
-      { name: "R",   az:   30, lfe: false },
-      { name: "C",   az:    0, lfe: false },
-      { name: "LFE", az:    0, lfe: true  },
-      { name: "Ls",  az:  -90, lfe: false },
-      { name: "Rs",  az:   90, lfe: false },
-      { name: "Lrs", az: -150, lfe: false },
-      { name: "Rrs", az:  150, lfe: false },
+      { name: "L",   az:  -30, el: 0, lfe: false },
+      { name: "R",   az:   30, el: 0, lfe: false },
+      { name: "C",   az:    0, el: 0, lfe: false },
+      { name: "LFE", az:    0, el: 0, lfe: true  },
+      { name: "Ls",  az:  -90, el: 0, lfe: false },
+      { name: "Rs",  az:   90, el: 0, lfe: false },
+      { name: "Lrs", az: -150, el: 0, lfe: false },
+      { name: "Rrs", az:  150, el: 0, lfe: false },
+    ],
+  },
+  "7.1.2": {
+    key: "7.1.2", label: "7.1.2", channels: 10,
+    channelMask: 0x0000563F,
+    // ch0-7 = 7.1 bed, ch8=Tfl ch9=Tfr
+    speakers: [
+      { name: "L",   az:  -30, el: 0,  lfe: false },
+      { name: "R",   az:   30, el: 0,  lfe: false },
+      { name: "C",   az:    0, el: 0,  lfe: false },
+      { name: "LFE", az:    0, el: 0,  lfe: true  },
+      { name: "Ls",  az:  -90, el: 0,  lfe: false },
+      { name: "Rs",  az:   90, el: 0,  lfe: false },
+      { name: "Lrs", az: -150, el: 0,  lfe: false },
+      { name: "Rrs", az:  150, el: 0,  lfe: false },
+      { name: "Tfl", az:  -35, el: 45, lfe: false },
+      { name: "Tfr", az:   35, el: 45, lfe: false },
+    ],
+  },
+  "7.1.4": {
+    key: "7.1.4", label: "7.1.4", channels: 12,
+    channelMask: 0x0002D63F,
+    // ch0-7 = 7.1 bed, ch8=Tfl ch9=Tfr ch10=Tbl ch11=Tbr
+    speakers: [
+      { name: "L",   az:  -30, el: 0,  lfe: false },
+      { name: "R",   az:   30, el: 0,  lfe: false },
+      { name: "C",   az:    0, el: 0,  lfe: false },
+      { name: "LFE", az:    0, el: 0,  lfe: true  },
+      { name: "Ls",  az:  -90, el: 0,  lfe: false },
+      { name: "Rs",  az:   90, el: 0,  lfe: false },
+      { name: "Lrs", az: -150, el: 0,  lfe: false },
+      { name: "Rrs", az:  150, el: 0,  lfe: false },
+      { name: "Tfl", az:  -35, el: 45, lfe: false },
+      { name: "Tfr", az:   35, el: 45, lfe: false },
+      { name: "Tbl", az: -145, el: 45, lfe: false },
+      { name: "Tbr", az:  145, el: 45, lfe: false },
+    ],
+  },
+  "7.2.4": {
+    key: "7.2.4", label: "7.2.4", channels: 13,
+    channelMask: 0x0002D63F,
+    // bed 7.1 + second LFE + four heights
+    speakers: [
+      { name: "L",    az:  -30, el: 0,  lfe: false },
+      { name: "R",    az:   30, el: 0,  lfe: false },
+      { name: "C",    az:    0, el: 0,  lfe: false },
+      { name: "LFE1", az:    0, el: 0,  lfe: true  },
+      { name: "Ls",   az:  -90, el: 0,  lfe: false },
+      { name: "Rs",   az:   90, el: 0,  lfe: false },
+      { name: "Lrs",  az: -150, el: 0,  lfe: false },
+      { name: "Rrs",  az:  150, el: 0,  lfe: false },
+      { name: "LFE2", az:    0, el: 0,  lfe: true  },
+      { name: "Tfl",  az:  -35, el: 45, lfe: false },
+      { name: "Tfr",  az:   35, el: 45, lfe: false },
+      { name: "Tbl",  az: -145, el: 45, lfe: false },
+      { name: "Tbr",  az:  145, el: 45, lfe: false },
     ],
   },
 };
@@ -172,11 +234,11 @@ const SURROUND_FORMATS = {
 //  Gains are constant-power normalised so total RMS ≈ 1.
 // ─────────────────────────────────────────────────────────────────────────────
 class SurroundPanner {
-  constructor(ctx, merger, format, defaultAz = 0) {
+  constructor(ctx, merger, format, defaultAz = 0, defaultEl = 0) {
     this.ctx     = ctx;
     this.format  = format;
     this.azimuth = defaultAz;
-    this.elevation = 0;
+    this.elevation = defaultEl;
 
     // Stereo input — Web Audio automatically downmixes to mono when connected
     // to a single-channel destination node.
@@ -204,12 +266,28 @@ class SurroundPanner {
   _update() {
     const { speakers } = this.format;
     const az = this.azimuth;
+    const el = this.elevation;
 
-    // Raw cosine gains
+    const sourceVector = [
+      Math.sin((az * Math.PI) / 180) * Math.cos((el * Math.PI) / 180),
+      Math.cos((az * Math.PI) / 180) * Math.cos((el * Math.PI) / 180),
+      Math.sin((el * Math.PI) / 180),
+    ];
+
+    // Raw cosine gains in 3D speaker space.
     const raw = speakers.map(s => {
       if (s.lfe) return 0.18; // fixed sub feed regardless of position
-      const diff = Math.abs(((az - s.az + 180) % 360) - 180);
-      return Math.max(0, Math.cos((diff / 120) * (Math.PI / 2)));
+      const speakerEl = s.el ?? 0;
+      const speakerVector = [
+        Math.sin((s.az * Math.PI) / 180) * Math.cos((speakerEl * Math.PI) / 180),
+        Math.cos((s.az * Math.PI) / 180) * Math.cos((speakerEl * Math.PI) / 180),
+        Math.sin((speakerEl * Math.PI) / 180),
+      ];
+      const dot =
+        sourceVector[0] * speakerVector[0] +
+        sourceVector[1] * speakerVector[1] +
+        sourceVector[2] * speakerVector[2];
+      return Math.max(0, Math.pow(Math.max(0, dot), 1.35));
     });
 
     // Constant-power normalisation over non-LFE speakers
@@ -250,6 +328,28 @@ const LAYER_DEFAULT_AZ = {
   mosquitoes: -85, // close left side
   heron:     30,   // right of centre
   gator:     -150, // rear-left
+};
+
+const LAYER_DEFAULT_EL = {
+  rain:        55,
+  waterfall:   8,
+  wind:        28,
+  thunder:     40,
+  surf:        10,
+  birds:       35,
+  bees:        8,
+  crickets:    0,
+  cicadas:     18,
+  frogs:       0,
+  drips:       20,
+  creek:       4,
+  fire:        0,
+  wolves:      0,
+  swamp:       0,
+  owl:         24,
+  mosquitoes:  30,
+  heron:       28,
+  gator:       0,
 };
 
 const SYNTH_KEYS = [
@@ -322,12 +422,13 @@ class AmbigramEngine {
       this.surroundPanners = {};
       SYNTH_KEYS.forEach(key => {
         this.surroundPanners[key] = new SurroundPanner(
-          this.ctx, merger, fmt, LAYER_DEFAULT_AZ[key] ?? 0
+          this.ctx, merger, fmt, LAYER_DEFAULT_AZ[key] ?? 0, LAYER_DEFAULT_EL[key] ?? 0
         );
       });
       // Reverb panner — biased toward rear (180°) for envelopment
-      const reverbPanner = new SurroundPanner(this.ctx, merger, fmt, 170);
+      const reverbPanner = new SurroundPanner(this.ctx, merger, fmt, 170, 22);
       reverbPanner.setAzimuth(170);
+      reverbPanner.setElevation(22);
 
       this.reverb = makeReverb(this.ctx, 3.2);
       this.reverbSend = this.ctx.createGain();
@@ -434,6 +535,9 @@ const CHANNEL_MASKS = {
   2: 0x00000003,             // FL FR
   6: 0x0000003F,             // FL FR FC LFE BL BR  (5.1)
   8: 0x0000063F,             // FL FR FC LFE BL BR SL SR  (7.1)
+  10: 0x0000563F,            // 7.1.2 with top-front pair
+  12: 0x0002D63F,            // 7.1.4 with top-front + top-back
+  13: 0x0002D63F,            // 7.2.4, second LFE intentionally unspecified
 };
 
 function writeString(view, offset, str) {
@@ -451,7 +555,7 @@ function writeGUID(view, offset, guid) {
 const PCM_GUID   = [0x00000001, 0x0000, 0x0010, [0x80,0x00,0x00,0xAA,0x00,0x38,0x9B,0x71]];
 const FLOAT_GUID = [0x00000003, 0x0000, 0x0010, [0x80,0x00,0x00,0xAA,0x00,0x38,0x9B,0x71]];
 
-function encodeWAV(channels, sampleRate, bitDepth) {
+function encodeWAV(channels, sampleRate, bitDepth, channelMask = 0) {
   const nCh      = channels.length;
   const nFrames  = channels[0].length;
   const bps      = bitDepth === 24 ? 3 : bitDepth / 8;
@@ -482,7 +586,7 @@ function encodeWAV(channels, sampleRate, bitDepth) {
   if (useExt) {
     view.setUint16(o, 22, true); o += 2;                   // cbSize
     view.setUint16(o, bitDepth, true); o += 2;             // wValidBitsPerSample
-    view.setUint32(o, CHANNEL_MASKS[nCh] ?? 0, true); o += 4; // dwChannelMask
+    view.setUint32(o, channelMask || CHANNEL_MASKS[nCh] || 0, true); o += 4; // dwChannelMask
     writeGUID(view, o, bitDepth === 32 ? FLOAT_GUID : PCM_GUID); o += 16;
   }
   // data chunk
@@ -2875,12 +2979,21 @@ function SurroundPositioner({ azimuth, onChange, color, format, size = 80 }) {
 
         {/* Speaker positions */}
         {format.speakers.filter(s => !s.lfe).map((sp, i) => {
-          const { x, y } = azToXY(sp.az, sr);
+          const speakerRadius = sr * (1 - ((sp.el ?? 0) / 90) * 0.35);
+          const { x, y } = azToXY(sp.az, speakerRadius);
           return (
             <g key={i}>
-              <circle cx={x} cy={y} r={4} fill="#1a3a22" stroke="#3a6a44" strokeWidth={1} />
+              <circle
+                cx={x}
+                cy={y}
+                r={(sp.el ?? 0) > 0 ? 3.4 : 4}
+                fill={(sp.el ?? 0) > 0 ? "#1d2f3f" : "#1a3a22"}
+                stroke={(sp.el ?? 0) > 0 ? "#72b8ff" : "#3a6a44"}
+                strokeWidth={1}
+              />
               <text x={x} y={y + 0.5} textAnchor="middle" dominantBaseline="middle"
-                fill="#3a6a44" fontSize={Math.max(5, size * 0.07)} fontFamily="monospace">
+                fill={(sp.el ?? 0) > 0 ? "#8dc5ff" : "#3a6a44"}
+                fontSize={Math.max(5, size * 0.07)} fontFamily="monospace">
                 {sp.name}
               </text>
             </g>
@@ -3329,7 +3442,7 @@ export default function Ambigram() {
     if (frames === 0) return;
     const sr  = engine.actualSampleRate || engine.sampleRate;
     const nCh = channels.length;
-    const wav = encodeWAV(channels, sr, bitDepth);
+    const wav = encodeWAV(channels, sr, bitDepth, engine.surroundFormat?.channelMask);
     const fmt = nCh > 2 ? `${nCh}ch-` : "";
     const ts  = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     downloadWAV(wav, `ambigram-${ts}-${fmt}${sr}hz-${bitDepth}bit.wav`);
