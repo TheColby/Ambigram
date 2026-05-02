@@ -11,6 +11,30 @@ The goal: procedural, living sound that never repeats. Rain that varies in densi
 
 ---
 
+## Quick Start
+
+```bash
+npm install
+./run.sh
+```
+
+Or, if you prefer using npm directly:
+
+```bash
+npm install
+npm run dev
+```
+
+Then open the local Vite URL in a Chromium-based browser for best Web MIDI support.
+
+### Release Notes
+
+- `node_modules/` and `dist/` are intentionally gitignored.
+- `./run.sh` is the one-command local launcher.
+- `npm run build` produces the production bundle in `dist/`.
+
+---
+
 ## Signal Chain
 
 ```mermaid

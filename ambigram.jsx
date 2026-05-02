@@ -73,6 +73,60 @@ function makeBrownBuffer(ctx, sec = 3) {
   return buf;
 }
 
+function applyBufferFade(buffer, fadeInMs = 0, fadeOutMs = fadeInMs) {
+  const fadeInSamples = Math.max(0, Math.floor((fadeInMs / 1000) * buffer.sampleRate));
+  const fadeOutSamples = Math.max(0, Math.floor((fadeOutMs / 1000) * buffer.sampleRate));
+
+  for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+    const data = buffer.getChannelData(ch);
+    const n = data.length;
+
+    for (let i = 0; i < fadeInSamples && i < n; i++) {
+      data[i] *= i / Math.max(1, fadeInSamples);
+    }
+
+    for (let i = 0; i < fadeOutSamples && i < n; i++) {
+      const idx = n - 1 - i;
+      if (idx < 0) break;
+      data[idx] *= i / Math.max(1, fadeOutSamples);
+    }
+  }
+
+  return buffer;
+}
+
+function holdAudioParam(param, ctx) {
+  const t = ctx.currentTime;
+  if (typeof param.cancelAndHoldAtTime === "function") {
+    try {
+      param.cancelAndHoldAtTime(t);
+      return t;
+    } catch (_) {}
+  }
+  const current = param.value;
+  param.cancelScheduledValues(t);
+  param.setValueAtTime(current, t);
+  return t;
+}
+
+function setAudioParamNow(param, ctx, value) {
+  const t = holdAudioParam(param, ctx);
+  param.setValueAtTime(value, t);
+  return t;
+}
+
+function rampAudioParam(param, ctx, value, seconds) {
+  const t = holdAudioParam(param, ctx);
+  param.linearRampToValueAtTime(value, t + seconds);
+  return t;
+}
+
+function targetAudioParam(param, ctx, value, timeConstant) {
+  const t = holdAudioParam(param, ctx);
+  param.setTargetAtTime(value, t, timeConstant);
+  return t;
+}
+
 // ─────────────────────────────────────────────
 //  REVERB — synthetic exponential impulse response
 // ─────────────────────────────────────────────
@@ -118,76 +172,385 @@ function karplusStrong(ctx, freq, decay = 0.995, durationSec = 1.5) {
   return buf;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  SURROUND FORMATS — speaker positions in azimuth/elevation degrees
+//  (0° azimuth = front-centre, CW positive; elevation 0° = ear level).
+//  Channel order follows ITU-R / Dolby-style bed ordering where possible.
+//  For 7.2.4 we duplicate the LFE feed to two channels; WAVE metadata can only
+//  describe one standard LFE bit, so the second sub remains intentionally
+//  unspecified in the channel mask.
+// ─────────────────────────────────────────────────────────────────────────────
+const SURROUND_FORMATS = {
+  stereo: {
+    key: "stereo", label: "Stereo", channels: 2,
+    channelMask: 0x00000003,
+    speakers: [
+      { name: "L",   az:  -30, el: 0, lfe: false },
+      { name: "R",   az:   30, el: 0, lfe: false },
+    ],
+  },
+  "5.1": {
+    key: "5.1", label: "5.1", channels: 6,
+    channelMask: 0x0000003F,
+    // ch0=L ch1=R ch2=C ch3=LFE ch4=Ls ch5=Rs
+    speakers: [
+      { name: "L",   az:  -30, el: 0, lfe: false },
+      { name: "R",   az:   30, el: 0, lfe: false },
+      { name: "C",   az:    0, el: 0, lfe: false },
+      { name: "LFE", az:    0, el: 0, lfe: true  },
+      { name: "Ls",  az: -110, el: 0, lfe: false },
+      { name: "Rs",  az:  110, el: 0, lfe: false },
+    ],
+  },
+  "7.1": {
+    key: "7.1", label: "7.1", channels: 8,
+    channelMask: 0x0000063F,
+    // ch0=L ch1=R ch2=C ch3=LFE ch4=Ls ch5=Rs ch6=Lrs ch7=Rrs
+    speakers: [
+      { name: "L",   az:  -30, el: 0, lfe: false },
+      { name: "R",   az:   30, el: 0, lfe: false },
+      { name: "C",   az:    0, el: 0, lfe: false },
+      { name: "LFE", az:    0, el: 0, lfe: true  },
+      { name: "Ls",  az:  -90, el: 0, lfe: false },
+      { name: "Rs",  az:   90, el: 0, lfe: false },
+      { name: "Lrs", az: -150, el: 0, lfe: false },
+      { name: "Rrs", az:  150, el: 0, lfe: false },
+    ],
+  },
+  "7.1.2": {
+    key: "7.1.2", label: "7.1.2", channels: 10,
+    channelMask: 0x0000563F,
+    // ch0-7 = 7.1 bed, ch8=Tfl ch9=Tfr
+    speakers: [
+      { name: "L",   az:  -30, el: 0,  lfe: false },
+      { name: "R",   az:   30, el: 0,  lfe: false },
+      { name: "C",   az:    0, el: 0,  lfe: false },
+      { name: "LFE", az:    0, el: 0,  lfe: true  },
+      { name: "Ls",  az:  -90, el: 0,  lfe: false },
+      { name: "Rs",  az:   90, el: 0,  lfe: false },
+      { name: "Lrs", az: -150, el: 0,  lfe: false },
+      { name: "Rrs", az:  150, el: 0,  lfe: false },
+      { name: "Tfl", az:  -35, el: 45, lfe: false },
+      { name: "Tfr", az:   35, el: 45, lfe: false },
+    ],
+  },
+  "7.1.4": {
+    key: "7.1.4", label: "7.1.4", channels: 12,
+    channelMask: 0x0002D63F,
+    // ch0-7 = 7.1 bed, ch8=Tfl ch9=Tfr ch10=Tbl ch11=Tbr
+    speakers: [
+      { name: "L",   az:  -30, el: 0,  lfe: false },
+      { name: "R",   az:   30, el: 0,  lfe: false },
+      { name: "C",   az:    0, el: 0,  lfe: false },
+      { name: "LFE", az:    0, el: 0,  lfe: true  },
+      { name: "Ls",  az:  -90, el: 0,  lfe: false },
+      { name: "Rs",  az:   90, el: 0,  lfe: false },
+      { name: "Lrs", az: -150, el: 0,  lfe: false },
+      { name: "Rrs", az:  150, el: 0,  lfe: false },
+      { name: "Tfl", az:  -35, el: 45, lfe: false },
+      { name: "Tfr", az:   35, el: 45, lfe: false },
+      { name: "Tbl", az: -145, el: 45, lfe: false },
+      { name: "Tbr", az:  145, el: 45, lfe: false },
+    ],
+  },
+  "7.2.4": {
+    key: "7.2.4", label: "7.2.4", channels: 13,
+    channelMask: 0x0002D63F,
+    // bed 7.1 + second LFE + four heights
+    speakers: [
+      { name: "L",    az:  -30, el: 0,  lfe: false },
+      { name: "R",    az:   30, el: 0,  lfe: false },
+      { name: "C",    az:    0, el: 0,  lfe: false },
+      { name: "LFE1", az:    0, el: 0,  lfe: true  },
+      { name: "Ls",   az:  -90, el: 0,  lfe: false },
+      { name: "Rs",   az:   90, el: 0,  lfe: false },
+      { name: "Lrs",  az: -150, el: 0,  lfe: false },
+      { name: "Rrs",  az:  150, el: 0,  lfe: false },
+      { name: "LFE2", az:    0, el: 0,  lfe: true  },
+      { name: "Tfl",  az:  -35, el: 45, lfe: false },
+      { name: "Tfr",  az:   35, el: 45, lfe: false },
+      { name: "Tbl",  az: -145, el: 45, lfe: false },
+      { name: "Tbr",  az:  145, el: 45, lfe: false },
+    ],
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SurroundPanner — VBAP-style per-layer spatial processor
+//
+//  Signal flow:
+//    input (stereo) → stereo→mono downmix → N×GainNode (per speaker) → ChannelMerger
+//
+//  The per-speaker gains are computed via a cosine panning law: a sound at
+//  azimuth θ contributes to speaker S with gain = max(0, cos(Δ/120 × π/2)),
+//  where Δ is the angular distance between source and speaker (clamped to 120°
+//  half-spread so non-adjacent speakers get zero contribution).
+//  Gains are constant-power normalised so total RMS ≈ 1.
+// ─────────────────────────────────────────────────────────────────────────────
+class SurroundPanner {
+  constructor(ctx, merger, format, defaultAz = 0, defaultEl = 0) {
+    this.ctx     = ctx;
+    this.format  = format;
+    this.azimuth = defaultAz;
+    this.elevation = defaultEl;
+
+    // Stereo input — Web Audio automatically downmixes to mono when connected
+    // to a single-channel destination node.
+    this.input = ctx.createGain();
+    this.input.gain.value = 1;
+
+    // One gain node per speaker channel, each forced to mono so the downmix
+    // happens cleanly and the output routes to the right merger input.
+    this._chGains = format.speakers.map((_, i) => {
+      const g = ctx.createGain();
+      g.channelCount     = 1;
+      g.channelCountMode = "explicit";
+      g.gain.value       = 0;
+      this.input.connect(g);
+      if (merger) g.connect(merger, 0, i); // mono → input i of merger
+      return g;
+    });
+
+    this._update();
+  }
+
+  setAzimuth(az)    { this.azimuth    = az; this._update(); }
+  setElevation(el)  { this.elevation  = el; this._update(); }
+
+  _update() {
+    const { speakers } = this.format;
+    const az = this.azimuth;
+    const el = this.elevation;
+
+    const sourceVector = [
+      Math.sin((az * Math.PI) / 180) * Math.cos((el * Math.PI) / 180),
+      Math.cos((az * Math.PI) / 180) * Math.cos((el * Math.PI) / 180),
+      Math.sin((el * Math.PI) / 180),
+    ];
+
+    // Raw cosine gains in 3D speaker space.
+    const raw = speakers.map(s => {
+      if (s.lfe) return 0.18; // fixed sub feed regardless of position
+      const speakerEl = s.el ?? 0;
+      const speakerVector = [
+        Math.sin((s.az * Math.PI) / 180) * Math.cos((speakerEl * Math.PI) / 180),
+        Math.cos((s.az * Math.PI) / 180) * Math.cos((speakerEl * Math.PI) / 180),
+        Math.sin((speakerEl * Math.PI) / 180),
+      ];
+      const dot =
+        sourceVector[0] * speakerVector[0] +
+        sourceVector[1] * speakerVector[1] +
+        sourceVector[2] * speakerVector[2];
+      return Math.max(0, Math.pow(Math.max(0, dot), 1.35));
+    });
+
+    // Constant-power normalisation over non-LFE speakers
+    const nonLfe = raw.filter((_, i) => !speakers[i].lfe);
+    const rms    = Math.sqrt(nonLfe.reduce((a, v) => a + v * v, 0));
+    const scale  = rms > 0 ? 0.85 / rms : 0;
+
+    const t = this.ctx.currentTime + 0.04;
+    raw.forEach((v, i) => {
+      const target = speakers[i].lfe ? v : v * scale;
+      this._chGains[i].gain.linearRampToValueAtTime(target, t);
+    });
+  }
+}
+
 // ─────────────────────────────────────────────
 //  MASTER ENGINE
 // ─────────────────────────────────────────────
 
+// Default azimuth positions — spread layers naturally around the soundfield
+const LAYER_DEFAULT_AZ = {
+  rain:      0,    // overhead / centre front
+  waterfall: -40,  // front-left
+  wind:      180,  // enveloping rear
+  thunder:   0,    // front centre
+  surf:      20,   // front-right wash
+  birds:     60,   // front-right
+  bees:      -60,  // front-left
+  crickets:  120,  // right surround
+  cicadas:   95,   // high right surround
+  frogs:     -120, // left surround
+  drips:     -20,  // slight left
+  creek:     -55,  // front-left stream
+  fire:      -10,  // near-centre
+  wolves:    145,  // far rear-right
+  swamp:     150,  // rear-right
+  owl:       -140, // rear-left perch
+  mosquitoes: -85, // close left side
+  heron:     30,   // right of centre
+  gator:     -150, // rear-left
+};
+
+const LAYER_DEFAULT_EL = {
+  rain:        55,
+  waterfall:   8,
+  wind:        28,
+  thunder:     40,
+  surf:        10,
+  birds:       35,
+  bees:        8,
+  crickets:    0,
+  cicadas:     18,
+  frogs:       0,
+  drips:       20,
+  creek:       4,
+  fire:        0,
+  wolves:      0,
+  swamp:       0,
+  owl:         24,
+  mosquitoes:  30,
+  heron:       28,
+  gator:       0,
+};
+
+const SYNTH_KEYS = [
+  "rain","waterfall","wind","thunder","surf","birds","bees",
+  "crickets","cicadas","frogs","drips","creek","fire","wolves",
+  "swamp","owl","mosquitoes","heron","gator"
+];
+
 class AmbigramEngine {
   constructor() {
-    this.ctx = null;
-    this.master = null;
-    this.reverbSend = null;
-    this.reverb = null;
-    this.drySend = null;
-    this.synths = {};
-    this.ready = false;
-    this.sampleRate = 96000;
+    this.ctx            = null;
+    this.master         = null;
+    this.reverbSend     = null;
+    this.reverb         = null;
+    this.drySend        = null;
+    this.synths         = {};
+    this.surroundPanners = {};
+    this.ready          = false;
+    this.sampleRate     = 96000;
+    this.surroundFormat = SURROUND_FORMATS.stereo;
   }
 
   async teardown() {
     if (!this.ctx) return;
-    // Stop all active synths gracefully
     Object.values(this.synths).forEach(s => { try { s.stop && s.stop(); } catch(_) {} });
     await this.ctx.close();
-    this.ctx = null;
-    this.master = null;
-    this.reverbSend = null;
-    this.reverb = null;
-    this.drySend = null;
-    this.synths = {};
-    this.ready = false;
+    this.ctx             = null;
+    this.master          = null;
+    this.reverbSend      = null;
+    this.reverb          = null;
+    this.drySend         = null;
+    this.synths          = {};
+    this.surroundPanners = {};
+    this.ready           = false;
   }
 
-  async init(sampleRate = this.sampleRate) {
+  async init(sampleRate = this.sampleRate, surroundKey = "stereo") {
     if (this.ready) return;
-    this.sampleRate = sampleRate;
+    this.sampleRate     = sampleRate;
+    this.surroundFormat = SURROUND_FORMATS[surroundKey] || SURROUND_FORMATS.stereo;
+    const fmt = this.surroundFormat;
+    const nCh = fmt.channels;
+
     this.ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
     if (this.ctx.state === "suspended") await this.ctx.resume();
-    // Actual rate the browser granted (may differ from requested)
     this.actualSampleRate = this.ctx.sampleRate;
 
+    // Master gain → destination
     this.master = this.ctx.createGain();
     this.master.gain.value = 0.85;
-    this.master.connect(this.ctx.destination);
 
-    // Wet path — reverb
-    this.reverb = makeReverb(this.ctx, 3.2);
-    this.reverbSend = this.ctx.createGain();
-    this.reverbSend.gain.value = 0.22;
-    this.reverbSend.connect(this.reverb);
-    this.reverb.connect(this.master);
+    // ── Multichannel path ──────────────────────────────────────────────────
+    if (nCh > 2) {
+      try {
+        this.ctx.destination.channelCount          = nCh;
+        this.ctx.destination.channelCountMode      = "explicit";
+        this.ctx.destination.channelInterpretation = "discrete";
+        this.master.channelCount          = nCh;
+        this.master.channelCountMode      = "explicit";
+        this.master.channelInterpretation = "discrete";
+      } catch (e) {
+        console.warn("Multichannel destination unavailable, browser will downmix:", e);
+      }
+      // ChannelMerger collects per-speaker mono signals → N-channel stream
+      const merger = this.ctx.createChannelMerger(nCh);
+      merger.connect(this.master);
+      this.master.connect(this.ctx.destination);
 
-    // Dry path
-    this.drySend = this.ctx.createGain();
-    this.drySend.gain.value = 1.0;
-    this.drySend.connect(this.master);
+      // Per-synth surround panners (each routes its signal to all N speakers)
+      this.surroundPanners = {};
+      SYNTH_KEYS.forEach(key => {
+        this.surroundPanners[key] = new SurroundPanner(
+          this.ctx, merger, fmt, LAYER_DEFAULT_AZ[key] ?? 0, LAYER_DEFAULT_EL[key] ?? 0
+        );
+      });
+      // Reverb panner — biased toward rear (180°) for envelopment
+      const reverbPanner = new SurroundPanner(this.ctx, merger, fmt, 170, 22);
+      reverbPanner.setAzimuth(170);
+      reverbPanner.setElevation(22);
 
-    const { ctx, drySend, reverbSend } = this;
+      this.reverb = makeReverb(this.ctx, 3.2);
+      this.reverbSend = this.ctx.createGain();
+      this.reverbSend.gain.value = 0.22;
+      this.reverbSend.connect(this.reverb);
+      this.reverb.connect(reverbPanner.input);
 
-    this.synths = {
-      rain:       new RainSynth(ctx, drySend, reverbSend),
-      waterfall:  new WaterfallSynth(ctx, drySend, reverbSend),
-      wind:       new WindSynth(ctx, drySend, reverbSend),
-      thunder:    new ThunderSynth(ctx, drySend, reverbSend),
-      birds:      new BirdSynth(ctx, drySend, reverbSend),
-      bees:       new BeeSynth(ctx, drySend, reverbSend),
-      crickets:   new CricketSynth(ctx, drySend, reverbSend),
-      frogs:      new FrogSynth(ctx, drySend, reverbSend),
-      drips:      new WaterDripSynth(ctx, drySend, reverbSend),
-      swamp:      new SwampSynth(ctx, drySend, reverbSend),
-      heron:      new HeronSynth(ctx, drySend, reverbSend),
-      gator:      new GatorSynth(ctx, drySend, reverbSend),
-    };
+      const ctx = this.ctx;
+      const rv  = this.reverbSend;
+      this.synths = {
+        rain:      new RainSynth(ctx,      this.surroundPanners.rain.input,      rv),
+        waterfall: new WaterfallSynth(ctx, this.surroundPanners.waterfall.input, rv),
+        wind:      new WindSynth(ctx,      this.surroundPanners.wind.input,      rv),
+        thunder:   new ThunderSynth(ctx,   this.surroundPanners.thunder.input,   rv),
+        surf:      new SurfSynth(ctx,      this.surroundPanners.surf.input,      rv),
+        birds:     new BirdSynth(ctx,      this.surroundPanners.birds.input,     rv),
+        bees:      new BeeSynth(ctx,       this.surroundPanners.bees.input,      rv),
+        crickets:  new CricketSynth(ctx,   this.surroundPanners.crickets.input,  rv),
+        cicadas:   new CicadaSynth(ctx,    this.surroundPanners.cicadas.input,   rv),
+        frogs:     new FrogSynth(ctx,      this.surroundPanners.frogs.input,     rv),
+        drips:     new WaterDripSynth(ctx, this.surroundPanners.drips.input,     rv),
+        creek:     new CreekSynth(ctx,     this.surroundPanners.creek.input,     rv),
+        fire:      new FireSynth(ctx,      this.surroundPanners.fire.input,      rv),
+        wolves:    new WolfSynth(ctx,      this.surroundPanners.wolves.input,    rv),
+        swamp:     new SwampSynth(ctx,     this.surroundPanners.swamp.input,     rv),
+        owl:       new OwlSynth(ctx,       this.surroundPanners.owl.input,       rv),
+        mosquitoes:new MosquitoSynth(ctx,  this.surroundPanners.mosquitoes.input,rv),
+        heron:     new HeronSynth(ctx,     this.surroundPanners.heron.input,     rv),
+        gator:     new GatorSynth(ctx,     this.surroundPanners.gator.input,     rv),
+      };
+
+    // ── Stereo path (unchanged) ────────────────────────────────────────────
+    } else {
+      this.master.connect(this.ctx.destination);
+
+      this.reverb = makeReverb(this.ctx, 3.2);
+      this.reverbSend = this.ctx.createGain();
+      this.reverbSend.gain.value = 0.22;
+      this.reverbSend.connect(this.reverb);
+      this.reverb.connect(this.master);
+
+      this.drySend = this.ctx.createGain();
+      this.drySend.gain.value = 1.0;
+      this.drySend.connect(this.master);
+
+      const { ctx, drySend, reverbSend } = this;
+      this.synths = {
+        rain:      new RainSynth(ctx,      drySend, reverbSend),
+        waterfall: new WaterfallSynth(ctx, drySend, reverbSend),
+        wind:      new WindSynth(ctx,      drySend, reverbSend),
+        thunder:   new ThunderSynth(ctx,   drySend, reverbSend),
+        surf:      new SurfSynth(ctx,      drySend, reverbSend),
+        birds:     new BirdSynth(ctx,      drySend, reverbSend),
+        bees:      new BeeSynth(ctx,       drySend, reverbSend),
+        crickets:  new CricketSynth(ctx,   drySend, reverbSend),
+        cicadas:   new CicadaSynth(ctx,    drySend, reverbSend),
+        frogs:     new FrogSynth(ctx,      drySend, reverbSend),
+        drips:     new WaterDripSynth(ctx, drySend, reverbSend),
+        creek:     new CreekSynth(ctx,     drySend, reverbSend),
+        fire:      new FireSynth(ctx,      drySend, reverbSend),
+        wolves:    new WolfSynth(ctx,      drySend, reverbSend),
+        swamp:     new SwampSynth(ctx,     drySend, reverbSend),
+        owl:       new OwlSynth(ctx,       drySend, reverbSend),
+        mosquitoes:new MosquitoSynth(ctx,  drySend, reverbSend),
+        heron:     new HeronSynth(ctx,     drySend, reverbSend),
+        gator:     new GatorSynth(ctx,     drySend, reverbSend),
+      };
+    }
 
     this.ready = true;
   }
@@ -199,70 +562,105 @@ class AmbigramEngine {
 
   setReverb(mix) {
     if (!this.reverbSend) return;
-    // Max gain raised to 2.0 so the top of the reverb knob is very wet / room-filling
     this.reverbSend.gain.linearRampToValueAtTime(mix * 2.0, this.ctx.currentTime + 0.1);
+  }
+
+  // Move a layer to a new azimuth (degrees, 0 = front-centre, CW positive)
+  setSurroundAz(layerId, az) {
+    if (this.surroundPanners[layerId]) this.surroundPanners[layerId].setAzimuth(az);
+  }
+
+  // Return max channel count the hardware can deliver
+  maxChannels() {
+    return this.ctx?.destination?.maxChannelCount ?? 2;
   }
 }
 
-// ─────────────────────────────────────────────
-//  WAV ENCODER — 16-bit PCM, 24-bit PCM, 32-bit IEEE float
-//  All arithmetic stays in 64-bit JS doubles until final write
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  WAV ENCODER — 16-bit PCM, 24-bit PCM, 32-bit IEEE float, N channels
+//
+//  channels: Float64Array[]  — one array per channel, all same length
+//  For N > 2: writes WAVE_FORMAT_EXTENSIBLE (tag 0xFFFE) with proper channel
+//  mask so DAWs and Windows Media correctly map speakers.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CHANNEL_MASKS = {
+  1: 0x00000004,             // FC
+  2: 0x00000003,             // FL FR
+  6: 0x0000003F,             // FL FR FC LFE BL BR  (5.1)
+  8: 0x0000063F,             // FL FR FC LFE BL BR SL SR  (7.1)
+  10: 0x0000563F,            // 7.1.2 with top-front pair
+  12: 0x0002D63F,            // 7.1.4 with top-front + top-back
+  13: 0x0002D63F,            // 7.2.4, second LFE intentionally unspecified
+};
 
 function writeString(view, offset, str) {
   for (let i = 0; i < str.length; i++)
     view.setUint8(offset + i, str.charCodeAt(i));
 }
 
-function encodeWAV(left, right, sampleRate, bitDepth) {
-  const numCh   = right ? 2 : 1;
-  const numFrames = left.length;
-  const bps     = bitDepth === 24 ? 3 : bitDepth / 8; // bytes per sample
-  const blockAlign = numCh * bps;
-  const byteRate   = sampleRate * blockAlign;
-  const dataSize   = numFrames * numCh * bps;
-  const buf = new ArrayBuffer(44 + dataSize);
+// Write a GUID into DataView (little-endian as per Windows GUID format)
+function writeGUID(view, offset, guid) {
+  view.setUint32(offset,      guid[0], true);
+  view.setUint16(offset + 4,  guid[1], true);
+  view.setUint16(offset + 6,  guid[2], true);
+  for (let i = 0; i < 8; i++) view.setUint8(offset + 8 + i, guid[3][i]);
+}
+const PCM_GUID   = [0x00000001, 0x0000, 0x0010, [0x80,0x00,0x00,0xAA,0x00,0x38,0x9B,0x71]];
+const FLOAT_GUID = [0x00000003, 0x0000, 0x0010, [0x80,0x00,0x00,0xAA,0x00,0x38,0x9B,0x71]];
+
+function encodeWAV(channels, sampleRate, bitDepth, channelMask = 0) {
+  const nCh      = channels.length;
+  const nFrames  = channels[0].length;
+  const bps      = bitDepth === 24 ? 3 : bitDepth / 8;
+  const block    = nCh * bps;
+  const dataSize = nFrames * block;
+
+  // Use EXTENSIBLE format for N ≠ 2 so channel mapping is explicit
+  const useExt   = nCh !== 2;
+  const fmtSize  = useExt ? 40 : 16;
+  const headerSz = 12 + 8 + fmtSize + 8; // RIFF + fmt chunk + data header
+  const buf  = new ArrayBuffer(headerSz + dataSize);
   const view = new DataView(buf);
 
-  // RIFF header
-  writeString(view, 0, "RIFF");
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(view, 8, "WAVE");
+  let o = 0;
+  // RIFF
+  writeString(view, o, "RIFF"); o += 4;
+  view.setUint32(o, 4 + (8 + fmtSize) + (8 + dataSize), true); o += 4;
+  writeString(view, o, "WAVE"); o += 4;
   // fmt chunk
-  writeString(view, 12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, bitDepth === 32 ? 3 : 1, true); // 3 = IEEE float, 1 = PCM
-  view.setUint16(22, numCh, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, bitDepth, true);
+  writeString(view, o, "fmt "); o += 4;
+  view.setUint32(o, fmtSize, true); o += 4;
+  view.setUint16(o, useExt ? 0xFFFE : (bitDepth === 32 ? 3 : 1), true); o += 2; // format tag
+  view.setUint16(o, nCh, true); o += 2;
+  view.setUint32(o, sampleRate, true); o += 4;
+  view.setUint32(o, sampleRate * block, true); o += 4;
+  view.setUint16(o, block, true); o += 2;
+  view.setUint16(o, bitDepth, true); o += 2;
+  if (useExt) {
+    view.setUint16(o, 22, true); o += 2;                   // cbSize
+    view.setUint16(o, bitDepth, true); o += 2;             // wValidBitsPerSample
+    view.setUint32(o, channelMask || CHANNEL_MASKS[nCh] || 0, true); o += 4; // dwChannelMask
+    writeGUID(view, o, bitDepth === 32 ? FLOAT_GUID : PCM_GUID); o += 16;
+  }
   // data chunk
-  writeString(view, 36, "data");
-  view.setUint32(40, dataSize, true);
+  writeString(view, o, "data"); o += 4;
+  view.setUint32(o, dataSize, true); o += 4;
 
-  let offset = 44;
-  for (let i = 0; i < numFrames; i++) {
-    const channels = right ? [left[i], right[i]] : [left[i]];
-    for (const s of channels) {
-      const clamped = Math.max(-1, Math.min(1, s));
+  // Interleaved sample data — all channels per frame
+  for (let f = 0; f < nFrames; f++) {
+    for (let c = 0; c < nCh; c++) {
+      const s = Math.max(-1, Math.min(1, channels[c][f]));
       if (bitDepth === 16) {
-        // 64-bit double → Int16 with TPDF dither
-        const dithered = clamped + tpdf() * 2;
-        view.setInt16(offset, Math.round(dithered * 0x7FFF), true);
-        offset += 2;
+        view.setInt16(o, Math.round((s + tpdf() * 2) * 0x7FFF), true); o += 2;
       } else if (bitDepth === 24) {
-        // 64-bit double → Int24 with TPDF dither
-        const dithered = clamped + tpdf();
-        const val = Math.round(dithered * 0x7FFFFF);
-        view.setUint8(offset,     val & 0xFF);
-        view.setUint8(offset + 1, (val >> 8)  & 0xFF);
-        view.setUint8(offset + 2, (val >> 16) & 0xFF);
-        offset += 3;
+        const v = Math.round((s + tpdf()) * 0x7FFFFF);
+        view.setUint8(o,     v & 0xFF);
+        view.setUint8(o + 1, (v >> 8)  & 0xFF);
+        view.setUint8(o + 2, (v >> 16) & 0xFF);
+        o += 3;
       } else {
-        // 32-bit IEEE float — no dither needed, native format
-        view.setFloat32(offset, clamped, true);
-        offset += 4;
+        view.setFloat32(o, s, true); o += 4;
       }
     }
   }
@@ -277,60 +675,60 @@ function downloadWAV(arrayBuffer, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
-// ─────────────────────────────────────────────
-//  RECORDER NODE — taps master bus, accumulates stereo PCM
+// ─────────────────────────────────────────────────────────────────────────────
+//  RECORDER NODE — taps master bus, accumulates N-channel PCM as Float64
 //  Uses ScriptProcessorNode (deprecated but universally supported).
-//  bufferSize 2048 keeps latency minimal at 96kHz.
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 class RecorderNode {
-  constructor(ctx, sourceNode) {
-    this.ctx = ctx;
-    this.recording = false;
-    this._chunksL = [];
-    this._chunksR = [];
+  constructor(ctx, sourceNode, nChannels = 2) {
+    this.ctx         = ctx;
+    this.nChannels   = nChannels;
+    this.recording   = false;
+    this._chunks     = Array.from({ length: nChannels }, () => []);
     this._totalFrames = 0;
 
-    // ScriptProcessorNode: 2 in, 2 out — must stay connected to destination
-    this._proc = ctx.createScriptProcessor(2048, 2, 2);
+    // Configure for N channels — ScriptProcessorNode max is 32
+    const n = Math.min(nChannels, 32);
+    this._proc = ctx.createScriptProcessor(2048, n, n);
+    try {
+      this._proc.channelCount          = n;
+      this._proc.channelCountMode      = "explicit";
+      this._proc.channelInterpretation = "discrete";
+    } catch (_) {}
+
     this._proc.onaudioprocess = (e) => {
       if (!this.recording) return;
-      // Copy both channels (Float32 from Web Audio = 32-bit in flight,
-      // but we immediately upcast to 64-bit doubles via slice())
-      const L = e.inputBuffer.getChannelData(0);
-      const R = e.inputBuffer.getChannelData(1);
-      this._chunksL.push(new Float64Array(L)); // 64-bit storage
-      this._chunksR.push(new Float64Array(R));
-      this._totalFrames += L.length;
+      const len = e.inputBuffer.getChannelData(0).length;
+      for (let c = 0; c < n; c++) {
+        const data = e.inputBuffer.getChannelData(Math.min(c, e.inputBuffer.numberOfChannels - 1));
+        this._chunks[c].push(new Float64Array(data));
+      }
+      this._totalFrames += len;
     };
 
     sourceNode.connect(this._proc);
-    this._proc.connect(ctx.destination); // required or callback never fires
+    this._proc.connect(ctx.destination);
   }
 
   start() {
-    this._chunksL = []; this._chunksR = [];
+    this._chunks     = Array.from({ length: this.nChannels }, () => []);
     this._totalFrames = 0;
-    this.recording = true;
+    this.recording   = true;
   }
 
   stop() {
     this.recording = false;
-    // Flatten chunks → two contiguous Float64Arrays
-    const L = new Float64Array(this._totalFrames);
-    const R = new Float64Array(this._totalFrames);
-    let off = 0;
-    for (let i = 0; i < this._chunksL.length; i++) {
-      L.set(this._chunksL[i], off);
-      R.set(this._chunksR[i], off);
-      off += this._chunksL[i].length;
-    }
-    return { L, R, frames: this._totalFrames };
+    const out = this._chunks.map(chunkArr => {
+      const flat = new Float64Array(this._totalFrames);
+      let off = 0;
+      for (const chunk of chunkArr) { flat.set(chunk, off); off += chunk.length; }
+      return flat;
+    });
+    return { channels: out, frames: this._totalFrames };
   }
 
-  destroy() {
-    this._proc.disconnect();
-  }
+  destroy() { this._proc.disconnect(); }
 }
 
 // ─────────────────────────────────────────────
@@ -363,23 +761,21 @@ class RainSynth {
     this._noise = this.ctx.createBufferSource();
     this._noise.buffer = buf; this._noise.loop = true;
     this._noise.connect(this.bp); this._noise.start();
-    this.gainNode.gain.linearRampToValueAtTime(
-      0.12 + 0.3 * this.level, this.ctx.currentTime + 1.5
-    );
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.12 + 0.3 * this.level, 1.5);
     this._scheduleDrop();
   }
 
   stop() {
     if (!this.active) return; this.active = false;
     clearTimeout(this._dropTimer);
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 2);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 2);
     if (this._noise) { this._noise.stop(this.ctx.currentTime + 2.5); this._noise = null; }
   }
 
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(0.08 + 0.32 * v, this.ctx.currentTime + 0.15);
+      rampAudioParam(this.gainNode.gain, this.ctx, 0.08 + 0.32 * v, 0.15);
   }
 
   _scheduleDrop() {
@@ -439,12 +835,12 @@ class WaterfallSynth {
       this.bands.forEach(bp => g.connect(bp));
       src.start(); this._sources.push(src);
     });
-    this.gainNode.gain.linearRampToValueAtTime(0.1 + 0.4 * this.level, this.ctx.currentTime + 2);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.1 + 0.4 * this.level, 2);
   }
 
   stop() {
     if (!this.active) return; this.active = false;
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 2.5);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 2.5);
     this._sources.forEach(s => s.stop(this.ctx.currentTime + 3));
     this._sources = [];
   }
@@ -452,7 +848,7 @@ class WaterfallSynth {
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(0.08 + 0.42 * v, this.ctx.currentTime + 0.15);
+      rampAudioParam(this.gainNode.gain, this.ctx, 0.08 + 0.42 * v, 0.15);
   }
 }
 
@@ -506,14 +902,14 @@ class WindSynth {
     this._source.buffer = buf; this._source.loop = true;
     this._source.connect(this.lp1); this._source.start();
     const base = 0.08 + 0.25 * this.level;
-    this.gainNode.gain.linearRampToValueAtTime(base, this.ctx.currentTime + 2.5);
+    rampAudioParam(this.gainNode.gain, this.ctx, base, 2.5);
     this.ampLfoGain.gain.value = base * 0.4;
     this.lfoGain.gain.value = 300 + 500 * this.level;
   }
 
   stop() {
     if (!this.active) return; this.active = false;
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 3);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 3);
     if (this._source) { this._source.stop(this.ctx.currentTime + 3.5); this._source = null; }
   }
 
@@ -521,7 +917,7 @@ class WindSynth {
     this.level = v;
     if (this.active) {
       const base = 0.05 + 0.28 * v;
-      this.gainNode.gain.linearRampToValueAtTime(base, this.ctx.currentTime + 0.2);
+      rampAudioParam(this.gainNode.gain, this.ctx, base, 0.2);
       this.ampLfoGain.gain.value = base * 0.4;
       this.lfoGain.gain.value = 250 + 600 * v;
     }
@@ -545,8 +941,8 @@ class WindSynth {
 class ThunderSynth {
   constructor(ctx, dry, wet) {
     this.ctx = ctx; this.dry = dry; this.wet = wet;
-    this.level    = 0.8;
-    this.distance = 0.35; // 0 = close/sharp, 1 = distant/rolling
+    this.level    = 1.0;
+    this.distance = 0.45; // 0 = close/sharp, 1 = distant/rolling
     this.autoMin  = 8000;
     this.autoMax  = 33000;
     this._autoTimer = null; this.autoMode = false;
@@ -560,50 +956,75 @@ class ThunderSynth {
     const t    = ctx.currentTime + 0.15;  // 150 ms look-ahead
     const dist = this.distance;
     const lvl  = this.level;
+    const near = this._nearFactor(dist);
+    const bodyDelay = 0.012 + dist * 0.085 + Math.random() * 0.018;
     // Rumble duration: close = shorter + more defined; distant = longer rolling
     const dur  = 2.5 + (1 + dist * 5) * (0.6 + Math.random() * 0.8);
 
-    if (dist < 0.5)                       this._crack(t, dist, lvl);
-    this._bang(t + dist * 0.06, dist, lvl);
-    this._rumble(t + 0.04, dur, dist, lvl);
+    if (near > 0.42)                      this._crack(t, dist, lvl, near);
+    this._bang(t + bodyDelay * 0.4, dist, lvl, near);
+    this._rumble(t + bodyDelay, dur, dist, lvl, near, 0);
+    if (dist > 0.58 || Math.random() < 0.72) {
+      const lateDelay = 0.16 + Math.random() * 0.24 + dist * 0.12;
+      this._rumble(
+        t + bodyDelay + lateDelay,
+        dur * (0.48 + Math.random() * 0.22),
+        Math.min(1, dist + 0.08),
+        lvl * 0.74,
+        near * 0.82,
+        1
+      );
+    }
     // 1–3 echo reflections; more when close (reflections are louder)
     const nEchoes = 1 + Math.floor((1.1 - dist) * 2 + Math.random() * 1.5);
     for (let i = 0; i < nEchoes; i++) {
-      this._echo(t + 0.28 + i * (0.22 + Math.random() * 0.45), i, dist, lvl);
+      this._echo(t + bodyDelay + 0.24 + i * (0.24 + Math.random() * 0.42), i, dist, lvl, near);
     }
   }
 
+  _nearFactor(dist) {
+    // Re-map the current thunder distance range (0.45..1) so "closest"
+    // strikes still hit hard even though the slider no longer goes to 0.
+    return Math.max(0, Math.min(1, 1 - ((dist - 0.45) / 0.55)));
+  }
+
   // ── 1. Sharp crack: 15–30 ms burst of highpassed white noise
-  _crack(t, dist, lvl) {
+  _crack(t, dist, lvl, near) {
     const ctx      = this.ctx;
-    const dur      = 0.014 + Math.random() * 0.014;
-    const amp      = (0.55 - dist * 1.1) * lvl;
-    if (amp <= 0) return;
+    const bursts   = 1 + Math.floor(near * 1.4 + Math.random() * 2);
+    const baseAmp  = (0.08 + near * 0.56) * lvl;
+    if (baseAmp <= 0) return;
 
-    const buf = makeWhiteBuffer(ctx, dur + 0.01);
-    const src = ctx.createBufferSource(); src.buffer = buf;
+    for (let i = 0; i < bursts; i++) {
+      const burstT = t + i * (0.003 + Math.random() * 0.0055);
+      const dur = 0.012 + Math.random() * 0.018;
+      const amp = baseAmp * (1 - i * 0.16) * (0.88 + Math.random() * 0.14);
+      const buf = applyBufferFade(makeWhiteBuffer(ctx, dur + 0.018), 7, 10);
+      const src = ctx.createBufferSource(); src.buffer = buf;
 
-    const hp = ctx.createBiquadFilter();
-    hp.type = "highpass"; hp.frequency.value = 900 + Math.random() * 700;
-    const lp = ctx.createBiquadFilter();
-    lp.type = "lowpass";  lp.frequency.value = 9000;
+      const hp = ctx.createBiquadFilter();
+      hp.type = "highpass"; hp.frequency.value = 650 + Math.random() * 1100 - i * 120;
+      const lp = ctx.createBiquadFilter();
+      lp.type = "lowpass";  lp.frequency.value = 3200 + Math.random() * 1800;
 
-    const env = ctx.createGain(); env.gain.value = 0;
-    env.gain.setValueAtTime(0, t);
-    env.gain.linearRampToValueAtTime(amp, t + 0.001);
-    env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      const env = ctx.createGain(); env.gain.value = 0;
+      env.gain.setValueAtTime(0, burstT);
+      env.gain.linearRampToValueAtTime(amp, burstT + 0.005);
+      env.gain.linearRampToValueAtTime(amp * 0.78, burstT + dur * 0.42);
+      env.gain.exponentialRampToValueAtTime(0.0001, burstT + dur);
 
-    src.connect(hp); hp.connect(lp); lp.connect(env); env.connect(this.dry);
-    src.start(t); src.stop(t + dur + 0.01);
+      src.connect(hp); hp.connect(lp); lp.connect(env); env.connect(this.dry);
+      src.start(burstT); src.stop(burstT + dur + 0.012);
+    }
   }
 
   // ── 2. Initial compression wave: brown noise, two resonant BPs, fast decay
-  _bang(t, dist, lvl) {
+  _bang(t, dist, lvl, near) {
     const ctx    = this.ctx;
     const dur    = 0.08 + (1 - dist) * 0.28;
-    const amp    = (0.72 - dist * 0.28) * lvl;
+    const amp    = (0.58 + near * 0.78) * lvl;
 
-    const buf = makeBrownBuffer(ctx, dur + 0.06);
+    const buf = applyBufferFade(makeBrownBuffer(ctx, dur + 0.06), 9, 12);
     const src = ctx.createBufferSource(); src.buffer = buf;
 
     const bp1 = ctx.createBiquadFilter();
@@ -624,55 +1045,66 @@ class ThunderSynth {
   }
 
   // ── 3. Rolling rumble: modal resonators + slow AM for the "rolling" texture
-  _rumble(t, dur, dist, lvl) {
+  _rumble(t, dur, dist, lvl, near, pass = 0) {
     const ctx = this.ctx;
-    const buf = makeBrownBuffer(ctx, dur + 1.5);
+    const buf = applyBufferFade(makeBrownBuffer(ctx, dur + 1.5), 16, 24);
     const src = ctx.createBufferSource(); src.buffer = buf;
+
+    const airLp = ctx.createBiquadFilter();
+    airLp.type = "lowpass";
+    airLp.frequency.value = 210 + near * 950 - pass * 45;
+    airLp.Q.value = 0.35;
+    src.connect(airLp);
 
     // Modal resonators at thunderclap frequencies
     const modes = [28, 45, 68, 95, 138].map((freq, i) => {
       const bp = ctx.createBiquadFilter();
       bp.type = "bandpass";
-      bp.frequency.value = freq * (0.88 + 0.24 * Math.random());
-      bp.Q.value = 2 + Math.random() * 3.5;
-      const mg = ctx.createGain(); mg.gain.value = 0.6 - i * 0.1;
-      src.connect(bp); bp.connect(mg);
+      bp.frequency.value = freq * (0.84 + 0.28 * Math.random()) * (1 - pass * 0.03);
+      bp.Q.value = 1.35 + Math.random() * 2.1;
+      const mg = ctx.createGain(); mg.gain.value = 0.82 - i * 0.13;
+      airLp.connect(bp); bp.connect(mg);
       return mg;
     });
 
-    // Rolling AM: oscillates between 0.6 and 1.0 at 0.3–1.5 Hz
-    const amRate  = 0.3 + Math.random() * 1.2;
-    const amOsc   = ctx.createOscillator(); amOsc.type = "sine";
-    amOsc.frequency.value = amRate;
-    const amDepth = ctx.createGain(); amDepth.gain.value = 0.2;  // ±0.2
-    const rollG   = ctx.createGain(); rollG.gain.value = 0.8;    // DC = 0.8
-    amOsc.connect(amDepth); amDepth.connect(rollG.gain);          // net: 0.6–1.0
+    // Rolling modulation: two slow, incommensurate LFOs feel less synthetic
+    const amOscA = ctx.createOscillator(); amOscA.type = "sine";
+    amOscA.frequency.value = 0.18 + Math.random() * 0.42;
+    const amOscB = ctx.createOscillator(); amOscB.type = "sine";
+    amOscB.frequency.value = 0.09 + Math.random() * 0.23;
+    const amDepthA = ctx.createGain(); amDepthA.gain.value = 0.12;
+    const amDepthB = ctx.createGain(); amDepthB.gain.value = 0.08;
+    const rollG   = ctx.createGain(); rollG.gain.value = 0.86;
+    amOscA.connect(amDepthA); amDepthA.connect(rollG.gain);
+    amOscB.connect(amDepthB); amDepthB.connect(rollG.gain);
 
     // Outer envelope — fade in then long slow decay
-    const amp    = (0.45 + (1 - dist) * 0.35) * lvl;
+    const amp    = (0.32 + near * 0.56) * lvl * (pass === 0 ? 1 : 0.82);
     const envG   = ctx.createGain(); envG.gain.value = 0;
     envG.gain.setValueAtTime(0, t);
-    envG.gain.linearRampToValueAtTime(amp, t + 0.35);
-    // Mid-rumble swell ±15%
-    const swell  = amp * (0.85 + Math.random() * 0.30);
-    envG.gain.linearRampToValueAtTime(swell, t + dur * 0.35);
+    envG.gain.linearRampToValueAtTime(amp * (0.82 + Math.random() * 0.12), t + 0.22 + pass * 0.06);
+    const swellA = amp * (0.92 + Math.random() * 0.16);
+    const swellB = amp * (0.70 + Math.random() * 0.20);
+    envG.gain.linearRampToValueAtTime(swellA, t + dur * 0.28);
+    envG.gain.linearRampToValueAtTime(swellB, t + dur * 0.58);
     envG.gain.exponentialRampToValueAtTime(0.0001, t + dur);
 
     modes.forEach(mg => mg.connect(rollG));
     rollG.connect(envG);
     envG.connect(this.dry); envG.connect(this.wet);
 
-    amOsc.start(t); amOsc.stop(t + dur + 1.5);
+    amOscA.start(t); amOscA.stop(t + dur + 1.5);
+    amOscB.start(t); amOscB.stop(t + dur + 1.5);
     src.start(t);   src.stop(t + dur + 1.5);
   }
 
   // ── 4. Echo reflections: each increasingly low-passed and quieter
-  _echo(t, idx, dist, lvl) {
+  _echo(t, idx, dist, lvl, near) {
     const ctx    = this.ctx;
     const dur    = 0.12 + Math.random() * 0.22;
-    const amp    = lvl * 0.22 * Math.pow(0.5, idx) * (0.4 + dist * 0.6);
+    const amp    = lvl * (0.16 + near * 0.16) * Math.pow(0.5, idx) * (0.55 + dist * 0.45);
 
-    const buf = makeBrownBuffer(ctx, dur + 0.06);
+    const buf = applyBufferFade(makeBrownBuffer(ctx, dur + 0.06), 9, 12);
     const src = ctx.createBufferSource(); src.buffer = buf;
 
     const lp = ctx.createBiquadFilter();
@@ -726,7 +1158,7 @@ class BirdSynth {
 
   start() {
     if (this.active) return; this.active = true;
-    this.masterGain.gain.linearRampToValueAtTime(0.15 + 0.3 * this.level, this.ctx.currentTime + 1);
+    rampAudioParam(this.masterGain.gain, this.ctx, 0.15 + 0.3 * this.level, 1);
     this._scheduleBird();
   }
 
@@ -734,13 +1166,13 @@ class BirdSynth {
     if (!this.active) return; this.active = false;
     this._timers.forEach(t => clearTimeout(t));
     this._timers = [];
-    this.masterGain.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 2);
+    rampAudioParam(this.masterGain.gain, this.ctx, 0.0001, 2);
   }
 
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.masterGain.gain.linearRampToValueAtTime(0.12 + 0.33 * v, this.ctx.currentTime + 0.2);
+      rampAudioParam(this.masterGain.gain, this.ctx, 0.12 + 0.33 * v, 0.2);
   }
 
   _scheduleBird() {
@@ -829,12 +1261,12 @@ class BeeSynth {
     this.gainNode.disconnect(); this.gainNode.connect(lp);
     lp.connect(dry); lp.connect(wet); this._lp = lp;
 
-    this.gainNode.gain.linearRampToValueAtTime(0.08 + 0.18 * this.level, ctx.currentTime + 1.5);
+    rampAudioParam(this.gainNode.gain, ctx, 0.08 + 0.18 * this.level, 1.5);
   }
 
   stop() {
     if (!this.active) return; this.active = false;
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 2);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 2);
     this._oscs.forEach(o => o.stop(this.ctx.currentTime + 2.5));
     if (this._lfo) this._lfo.stop(this.ctx.currentTime + 2.5);
     this._oscs = [];
@@ -843,7 +1275,7 @@ class BeeSynth {
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(0.06 + 0.2 * v, this.ctx.currentTime + 0.15);
+      rampAudioParam(this.gainNode.gain, this.ctx, 0.06 + 0.2 * v, 0.15);
   }
 }
 
@@ -880,12 +1312,12 @@ class CricketSynth {
       this._oscs.push(osc); this._lfos.push(lfo);
     });
 
-    this.gainNode.gain.linearRampToValueAtTime(0.1 + 0.25 * this.level, ctx.currentTime + 2);
+    rampAudioParam(this.gainNode.gain, ctx, 0.1 + 0.25 * this.level, 2);
   }
 
   stop() {
     if (!this.active) return; this.active = false;
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 2);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 2);
     [...this._oscs, ...this._lfos].forEach(o => o.stop(this.ctx.currentTime + 2.5));
     this._oscs = []; this._lfos = [];
   }
@@ -893,7 +1325,7 @@ class CricketSynth {
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(0.08 + 0.28 * v, this.ctx.currentTime + 0.15);
+      rampAudioParam(this.gainNode.gain, this.ctx, 0.08 + 0.28 * v, 0.15);
   }
 }
 
@@ -963,20 +1395,20 @@ class FrogSynth {
 
   start() {
     if (this.active) return; this.active = true;
-    this.gainNode.gain.linearRampToValueAtTime(1.0, this.ctx.currentTime + 1);
+    rampAudioParam(this.gainNode.gain, this.ctx, 1.0, 1);
     this._scheduleFrog();
   }
 
   stop() {
     if (!this.active) return; this.active = false;
     this._timers.forEach(t => clearTimeout(t)); this._timers = [];
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 2);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 2);
   }
 
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(1.0, this.ctx.currentTime + 0.2);
+      rampAudioParam(this.gainNode.gain, this.ctx, 1.0, 0.2);
   }
 
   _scheduleFrog() {
@@ -1135,20 +1567,20 @@ class WaterDripSynth {
 
   start() {
     if (this.active) return; this.active = true;
-    this.gainNode.gain.linearRampToValueAtTime(0.12 + 0.3 * this.level, this.ctx.currentTime + 0.5);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.12 + 0.3 * this.level, 0.5);
     this._schedule();
   }
 
   stop() {
     if (!this.active) return; this.active = false;
     clearTimeout(this._timer);
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 1);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 1);
   }
 
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(0.1 + 0.32 * v, this.ctx.currentTime + 0.1);
+      rampAudioParam(this.gainNode.gain, this.ctx, 0.1 + 0.32 * v, 0.1);
   }
 
   _schedule() {
@@ -1217,12 +1649,12 @@ class SwampSynth {
     noiseG.connect(this.gainNode);
     noiseSrc.start(); this._oscs.push(noiseSrc);
 
-    this.gainNode.gain.linearRampToValueAtTime(0.12 + 0.28 * this.level, ctx.currentTime + 3);
+    rampAudioParam(this.gainNode.gain, ctx, 0.12 + 0.28 * this.level, 3);
   }
 
   stop() {
     if (!this.active) return; this.active = false;
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 3);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 3);
     [...this._oscs, ...this._lfos].forEach(o => { try { o.stop(this.ctx.currentTime + 3.5); } catch(_){} });
     this._oscs = []; this._lfos = []; this._noiseLp = null;
   }
@@ -1230,7 +1662,7 @@ class SwampSynth {
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(0.1 + 0.3 * v, this.ctx.currentTime + 0.2);
+      rampAudioParam(this.gainNode.gain, this.ctx, 0.1 + 0.3 * v, 0.2);
   }
 }
 
@@ -1244,21 +1676,24 @@ class HeronSynth {
     this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
     this.gainNode.connect(dry); this.gainNode.connect(wet);
     this._timer = null;
+    this._previewTimer = null;
   }
 
   start() {
     if (this.active) return; this.active = true;
-    this.gainNode.gain.value = this.level * 0.4;
+    setAudioParamNow(this.gainNode.gain, this.ctx, this.level * 0.4);
+    this._previewTimer = setTimeout(() => { if (this.active) this._call(); }, 180 + Math.random() * 220);
     this._schedule();
   }
 
   stop() {
     if (!this.active) return; this.active = false;
     clearTimeout(this._timer);
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 1);
+    clearTimeout(this._previewTimer);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 1);
   }
 
-  setLevel(v) { this.level = v; if (this.active) this.gainNode.gain.value = v * 0.4; }
+  setLevel(v) { this.level = v; if (this.active) setAudioParamNow(this.gainNode.gain, this.ctx, v * 0.4); }
 
   _schedule() {
     if (!this.active) return;
@@ -1296,21 +1731,24 @@ class GatorSynth {
     this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
     this.gainNode.connect(dry); this.gainNode.connect(wet);
     this._timer = null;
+    this._previewTimer = null;
   }
 
   start() {
     if (this.active) return; this.active = true;
-    this.gainNode.gain.value = this.level * 0.35;
+    setAudioParamNow(this.gainNode.gain, this.ctx, this.level * 0.35);
+    this._previewTimer = setTimeout(() => { if (this.active) this._bellow(); }, 220 + Math.random() * 260);
     this._schedule();
   }
 
   stop() {
     if (!this.active) return; this.active = false;
     clearTimeout(this._timer);
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 1);
+    clearTimeout(this._previewTimer);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 1);
   }
 
-  setLevel(v) { this.level = v; if (this.active) this.gainNode.gain.value = v * 0.35; }
+  setLevel(v) { this.level = v; if (this.active) setAudioParamNow(this.gainNode.gain, this.ctx, v * 0.35); }
 
   _schedule() {
     if (!this.active) return;
@@ -1342,6 +1780,483 @@ class GatorSynth {
     nEnv.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     nSrc.connect(nLp); nLp.connect(nEnv); nEnv.connect(this.gainNode);
     nSrc.start(t); nSrc.stop(t + dur + 0.1);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  CICADA CHORUS — AM-pulsed narrow-band noise, 3 voices
+// ─────────────────────────────────────────────
+
+class CicadaSynth {
+  constructor(ctx, dry, wet) {
+    this.ctx = ctx; this.active = false; this.level = 0.5;
+    this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
+    this.gainNode.connect(dry); this.gainNode.connect(wet);
+    this._srcs = []; this._amLfos = []; this._bps = [];
+  }
+
+  start() {
+    if (this.active) return; this.active = true;
+    const ctx = this.ctx;
+    [4500, 4640, 4360].forEach((freq, i) => {
+      const src = ctx.createBufferSource();
+      src.buffer = makePinkBuffer(ctx, 4); src.loop = true;
+
+      const bp = ctx.createBiquadFilter();
+      bp.type = "bandpass"; bp.frequency.value = freq; bp.Q.value = 22;
+
+      // Wing-beat AM: 28–35 Hz, each voice slightly offset
+      const amLfo  = ctx.createOscillator();
+      amLfo.type   = "sine";
+      amLfo.frequency.value = 28 + i * 3.2 + Math.random();
+      const amGain = ctx.createGain(); amGain.gain.value = 0.42;
+      const amAmp  = ctx.createGain(); amAmp.gain.value  = 0.58;
+      amLfo.connect(amGain); amGain.connect(amAmp.gain);
+
+      src.connect(bp); bp.connect(amAmp); amAmp.connect(this.gainNode);
+      src.start(); amLfo.start();
+      this._srcs.push(src); this._amLfos.push(amLfo); this._bps.push(bp);
+    });
+    targetAudioParam(this.gainNode.gain, ctx, this.level * 0.28, 1.5);
+  }
+
+  stop() {
+    if (!this.active) return; this.active = false;
+    const t = this.ctx.currentTime;
+    targetAudioParam(this.gainNode.gain, this.ctx, 0, 0.8);
+    [...this._srcs, ...this._amLfos].forEach(n => { try { n.stop(t + 4); } catch(_) {} });
+    this._srcs = []; this._amLfos = []; this._bps = [];
+  }
+
+  setLevel(v) {
+    this.level = v;
+    if (this.active) targetAudioParam(this.gainNode.gain, this.ctx, v * 0.28, 0.1);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  OCEAN SURF — LFO-swept noise resonator + low boom
+// ─────────────────────────────────────────────
+
+class SurfSynth {
+  constructor(ctx, dry, wet) {
+    this.ctx = ctx; this.active = false; this.level = 0.5;
+    this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
+    this.gainNode.connect(dry); this.gainNode.connect(wet);
+    this._nodes = []; this._lfo = null; this._lfoGain = null; this._ampLfo = null;
+  }
+
+  start() {
+    if (this.active) return; this.active = true;
+    const ctx = this.ctx;
+
+    // Noise body
+    const src = ctx.createBufferSource();
+    src.buffer = makeBrownBuffer(ctx, 8); src.loop = true;
+
+    // Sweep LPF — gives the rolling wave wash
+    const lp = ctx.createBiquadFilter();
+    lp.type = "lowpass"; lp.frequency.value = 800; lp.Q.value = 0.5;
+    this._lp = lp;
+
+    const lfo = ctx.createOscillator();
+    lfo.type = "sine"; lfo.frequency.value = 0.11;
+    this._lfo = lfo;
+    const lfoGain = ctx.createGain(); lfoGain.gain.value = 600;
+    this._lfoGain = lfoGain;
+    lfo.connect(lfoGain); lfoGain.connect(lp.frequency);
+
+    // Amplitude swell (wave volume rises and falls)
+    const ampLfo = ctx.createOscillator();
+    ampLfo.type = "sine"; ampLfo.frequency.value = 0.095;
+    this._ampLfo = ampLfo;
+    const ampMod  = ctx.createGain(); ampMod.gain.value  = 0.26;
+    const ampDC   = ctx.createGain(); ampDC.gain.value   = 0.74;
+    ampLfo.connect(ampMod); ampMod.connect(ampDC.gain);
+
+    const hp = ctx.createBiquadFilter();
+    hp.type = "highpass"; hp.frequency.value = 55;
+
+    src.connect(hp); hp.connect(lp); lp.connect(ampDC); ampDC.connect(this.gainNode);
+
+    // Low breaking-wave boom
+    const bSrc = ctx.createBufferSource();
+    bSrc.buffer = makeBrownBuffer(ctx, 8); bSrc.loop = true;
+    const bBp = ctx.createBiquadFilter();
+    bBp.type = "bandpass"; bBp.frequency.value = 110; bBp.Q.value = 0.5;
+    const bG = ctx.createGain(); bG.gain.value = 0.55;
+    bSrc.connect(bBp); bBp.connect(bG); bG.connect(this.gainNode);
+
+    src.start(); bSrc.start(); lfo.start(); ampLfo.start();
+    this._nodes = [src, bSrc, lfo, ampLfo];
+    targetAudioParam(this.gainNode.gain, ctx, this.level * 0.45, 2);
+  }
+
+  stop() {
+    if (!this.active) return; this.active = false;
+    const t = this.ctx.currentTime;
+    targetAudioParam(this.gainNode.gain, this.ctx, 0, 1.5);
+    this._nodes.forEach(n => { try { n.stop(t + 6); } catch(_) {} });
+    this._nodes = [];
+  }
+
+  setLevel(v) {
+    this.level = v;
+    if (this.active) targetAudioParam(this.gainNode.gain, this.ctx, v * 0.45, 0.15);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  OWL CALL — FM "hoo-HOO-hoo" great-horned hoot
+// ─────────────────────────────────────────────
+
+class OwlSynth {
+  constructor(ctx, dry, wet) {
+    this.ctx = ctx; this.active = false; this.level = 0.5;
+    this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
+    this.gainNode.connect(dry); this.gainNode.connect(wet);
+    this._timer = null;
+    this._previewTimer = null;
+    this._intervalMult = 1;
+    this._pitchBase    = 280;
+  }
+
+  start() {
+    if (this.active) return;
+    this.active = true;
+    setAudioParamNow(this.gainNode.gain, this.ctx, this.level);
+    this._previewTimer = setTimeout(() => { if (this.active) this._call(); }, 150 + Math.random() * 200);
+    this._schedule();
+  }
+
+  stop() {
+    if (!this.active) return; this.active = false;
+    clearTimeout(this._timer);
+    clearTimeout(this._previewTimer);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0, 0.5);
+  }
+
+  setLevel(v) { this.level = v; if (this.active) setAudioParamNow(this.gainNode.gain, this.ctx, v); }
+
+  _schedule() {
+    if (!this.active) return;
+    // Great horned owl: 1–4 minutes between calls
+    const ms = (60000 + Math.random() * 180000) * this._intervalMult;
+    this._timer = setTimeout(() => { this._call(); this._schedule(); }, ms);
+  }
+
+  _hoot(t, freq, dur, vol) {
+    const ctx = this.ctx;
+    const mod = ctx.createOscillator(); mod.type = "sine";
+    mod.frequency.value = freq * 1.004;
+    const modGain = ctx.createGain(); modGain.gain.value = freq * 0.09;
+    mod.connect(modGain);
+
+    const car = ctx.createOscillator(); car.type = "sine";
+    car.frequency.value = freq;
+    modGain.connect(car.frequency);
+
+    const vib = ctx.createOscillator(); vib.type = "sine"; vib.frequency.value = 5.5;
+    const vibG = ctx.createGain(); vibG.gain.value = 5;
+    vib.connect(vibG); vibG.connect(car.frequency);
+
+    const env = ctx.createGain(); env.gain.setValueAtTime(0, t);
+    env.gain.linearRampToValueAtTime(vol, t + 0.06);
+    env.gain.setValueAtTime(vol, t + dur - 0.12);
+    env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+    car.connect(env); env.connect(this.gainNode);
+    [car, mod, vib].forEach(n => { n.start(t); n.stop(t + dur + 0.05); });
+  }
+
+  _call() {
+    const t = this.ctx.currentTime + 0.1;
+    const p = this._pitchBase; const v = this.level * 0.55;
+    // "hoo — hoo-HOO — hoo-hoo"
+    this._hoot(t,        p,        0.45, v * 0.70);
+    this._hoot(t + 0.65, p,        0.35, v * 0.70);
+    this._hoot(t + 1.10, p * 1.04, 0.55, v);
+    this._hoot(t + 1.80, p,        0.35, v * 0.70);
+    this._hoot(t + 2.25, p,        0.40, v * 0.75);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  CAMPFIRE — filtered crackle body + random pops
+// ─────────────────────────────────────────────
+
+class FireSynth {
+  constructor(ctx, dry, wet) {
+    this.ctx = ctx; this.active = false; this.level = 0.5;
+    this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
+    this.gainNode.connect(dry); this.gainNode.connect(wet);
+    this._srcs = []; this._popTimer = null;
+    this._lp = null; this._popRateScale = 1;
+  }
+
+  start() {
+    if (this.active) return; this.active = true;
+    const ctx = this.ctx;
+
+    // Crackle body: bandpassed white noise
+    const wSrc = ctx.createBufferSource();
+    wSrc.buffer = makeWhiteBuffer(ctx, 4); wSrc.loop = true;
+    const hp = ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 500;
+    const lp = ctx.createBiquadFilter(); lp.type = "lowpass";  lp.frequency.value = 3500;
+    this._lp = lp;
+    const cracklG = ctx.createGain(); cracklG.gain.value = 0.18;
+
+    // Flame flicker AM at ~0.8 Hz
+    const flameLfo = ctx.createOscillator(); flameLfo.type = "sine"; flameLfo.frequency.value = 0.8;
+    const flameM   = ctx.createGain(); flameM.gain.value  = 0.12;
+    const flameAmp = ctx.createGain(); flameAmp.gain.value = 0.88;
+    flameLfo.connect(flameM); flameM.connect(flameAmp.gain);
+
+    wSrc.connect(hp); hp.connect(lp); lp.connect(cracklG); cracklG.connect(flameAmp);
+    flameAmp.connect(this.gainNode);
+
+    // Bed of coals: low rumble
+    const bSrc = ctx.createBufferSource();
+    bSrc.buffer = makeBrownBuffer(ctx, 4); bSrc.loop = true;
+    const bBp = ctx.createBiquadFilter(); bBp.type = "bandpass"; bBp.frequency.value = 180; bBp.Q.value = 0.8;
+    const bG  = ctx.createGain(); bG.gain.value = 0.22;
+    bSrc.connect(bBp); bBp.connect(bG); bG.connect(this.gainNode);
+
+    wSrc.start(); bSrc.start(); flameLfo.start();
+    this._srcs = [wSrc, bSrc, flameLfo];
+    targetAudioParam(this.gainNode.gain, ctx, this.level * 0.35, 1.0);
+    this._popLoop();
+  }
+
+  _popLoop() {
+    if (!this.active) return;
+    const ms = (300 + Math.random() * 1800) / this._popRateScale;
+    this._popTimer = setTimeout(() => { if (this.active) { this._pop(); this._popLoop(); } }, ms);
+  }
+
+  _pop() {
+    const ctx = this.ctx; const t = ctx.currentTime + 0.02;
+    const freq = 600 + Math.random() * 2200;
+    const dur  = 0.018 + Math.random() * 0.045;
+    const src  = ctx.createBufferSource(); src.buffer = makeWhiteBuffer(ctx, 0.1);
+    const bp   = ctx.createBiquadFilter(); bp.type = "bandpass"; bp.frequency.value = freq; bp.Q.value = 9;
+    const env  = ctx.createGain(); env.gain.setValueAtTime(0, t);
+    env.gain.linearRampToValueAtTime(this.level * 0.85, t + 0.003);
+    env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(bp); bp.connect(env); env.connect(this.gainNode);
+    src.start(t); src.stop(t + dur + 0.02);
+  }
+
+  stop() {
+    if (!this.active) return; this.active = false;
+    clearTimeout(this._popTimer);
+    const t = this.ctx.currentTime;
+    targetAudioParam(this.gainNode.gain, this.ctx, 0, 1.0);
+    this._srcs.forEach(n => { try { n.stop(t + 4); } catch(_) {} });
+    this._srcs = [];
+  }
+
+  setLevel(v) {
+    this.level = v;
+    if (this.active) targetAudioParam(this.gainNode.gain, this.ctx, v * 0.35, 0.1);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  WOLF HOWL — pitch-sweeping sawtooth FM
+// ─────────────────────────────────────────────
+
+class WolfSynth {
+  constructor(ctx, dry, wet) {
+    this.ctx = ctx; this.active = false; this.level = 0.5;
+    this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
+    this.gainNode.connect(dry); this.gainNode.connect(wet);
+    this._timer = null;
+    this._previewTimer = null;
+    this._intervalMult = 1;
+    this._pitchBase    = 220;
+  }
+
+  start() {
+    if (this.active) return;
+    this.active = true;
+    setAudioParamNow(this.gainNode.gain, this.ctx, this.level);
+    this._previewTimer = setTimeout(() => { if (this.active) this._pack(); }, 180 + Math.random() * 260);
+    this._schedule();
+  }
+
+  stop() {
+    if (!this.active) return; this.active = false;
+    clearTimeout(this._timer);
+    clearTimeout(this._previewTimer);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0, 1.5);
+  }
+
+  setLevel(v) { this.level = v; if (this.active) setAudioParamNow(this.gainNode.gain, this.ctx, v); }
+
+  _schedule() {
+    if (!this.active) return;
+    // Wolves howl every 3–8 minutes
+    const ms = (180000 + Math.random() * 300000) * this._intervalMult;
+    this._timer = setTimeout(() => { this._pack(); this._schedule(); }, ms);
+  }
+
+  _howl(t, startPitch, peakPitch, dur, vol) {
+    const ctx = this.ctx;
+    const mod = ctx.createOscillator(); mod.type = "sine";
+    mod.frequency.setValueAtTime(startPitch * 0.5, t);
+    mod.frequency.linearRampToValueAtTime(peakPitch * 0.5, t + dur * 0.4);
+    const modGain = ctx.createGain(); modGain.gain.value = startPitch * 1.1;
+    mod.connect(modGain);
+
+    const car = ctx.createOscillator(); car.type = "sawtooth";
+    car.frequency.setValueAtTime(startPitch, t);
+    car.frequency.linearRampToValueAtTime(peakPitch,        t + dur * 0.35);
+    car.frequency.setValueAtTime(peakPitch,                 t + dur * 0.60);
+    car.frequency.linearRampToValueAtTime(peakPitch * 0.91, t + dur);
+    modGain.connect(car.frequency);
+
+    const lp = ctx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 2200;
+
+    const env = ctx.createGain(); env.gain.setValueAtTime(0, t);
+    env.gain.linearRampToValueAtTime(vol, t + 0.3);
+    env.gain.setValueAtTime(vol, t + dur - 0.8);
+    env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+    car.connect(lp); lp.connect(env); env.connect(this.gainNode);
+    car.start(t); mod.start(t); car.stop(t + dur + 0.1); mod.stop(t + dur + 0.1);
+  }
+
+  _pack() {
+    const t = this.ctx.currentTime + 0.1;
+    const p = this._pitchBase; const v = this.level * 0.65;
+    const nWolves = Math.random() < 0.4 ? 2 : 1;
+    for (let i = 0; i < nWolves; i++) {
+      const off   = i * (0.8 + Math.random() * 1.2);
+      const pitch = p * (0.88 + Math.random() * 0.28);
+      this._howl(t + off, pitch * 0.68, pitch, 4 + Math.random() * 3, v * (0.7 + Math.random() * 0.3));
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+//  MOSQUITO — near-ear high-frequency whine
+// ─────────────────────────────────────────────
+
+class MosquitoSynth {
+  constructor(ctx, dry, wet) {
+    this.ctx = ctx; this.active = false; this.level = 0.5;
+    this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
+    this.gainNode.connect(dry); this.gainNode.connect(wet);
+    this._oscs = []; this._lfos = [];
+  }
+
+  start() {
+    if (this.active) return; this.active = true;
+    const ctx = this.ctx;
+
+    [420, 435, 450].forEach((freq, i) => {
+      const osc = ctx.createOscillator(); osc.type = "sine";
+      osc.frequency.value = freq;
+
+      // Very slow drift so pitches wander slightly (±5 Hz)
+      const drift = ctx.createOscillator(); drift.type = "sine";
+      drift.frequency.value = 0.07 + i * 0.03;
+      const driftG = ctx.createGain(); driftG.gain.value = 5 + i * 1.5;
+      drift.connect(driftG); driftG.connect(osc.frequency);
+
+      // Slow proximity AM (0.3–0.8 Hz — buzz coming closer/farther)
+      const prox  = ctx.createOscillator(); prox.type = "sine"; prox.frequency.value = 0.3 + i * 0.18;
+      const proxM = ctx.createGain(); proxM.gain.value = 0.25;
+      const proxA = ctx.createGain(); proxA.gain.value = 0.75;
+      prox.connect(proxM); proxM.connect(proxA.gain);
+      osc.connect(proxA); proxA.connect(this.gainNode);
+
+      osc.start(); drift.start(); prox.start();
+      this._oscs.push(osc); this._lfos.push(drift, prox);
+    });
+
+    targetAudioParam(this.gainNode.gain, ctx, this.level * 0.07, 0.5);
+  }
+
+  stop() {
+    if (!this.active) return; this.active = false;
+    const t = this.ctx.currentTime;
+    targetAudioParam(this.gainNode.gain, this.ctx, 0, 0.3);
+    [...this._oscs, ...this._lfos].forEach(n => { try { n.stop(t + 1); } catch(_) {} });
+    this._oscs = []; this._lfos = [];
+  }
+
+  setLevel(v) {
+    this.level = v;
+    if (this.active) targetAudioParam(this.gainNode.gain, this.ctx, v * 0.07, 0.1);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  CREEK — babbling brook, 4-band resonator with random-walk band tuning
+// ─────────────────────────────────────────────
+
+class CreekSynth {
+  constructor(ctx, dry, wet) {
+    this.ctx = ctx; this.active = false; this.level = 0.5;
+    this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
+    this.gainNode.connect(dry); this.gainNode.connect(wet);
+    this._srcs = []; this._bps = []; this._rwTimer = null;
+    this._rwSpeed = 1;
+  }
+
+  start() {
+    if (this.active) return; this.active = true;
+    const ctx = this.ctx;
+    const wBuf = makeWhiteBuffer(ctx, 8);
+    const bBuf = makeBrownBuffer(ctx, 8);
+
+    [
+      { fc: 320,  q: 1.2, amp: 0.90, noise: "brown" },
+      { fc: 700,  q: 1.0, amp: 0.65, noise: "brown" },
+      { fc: 1800, q: 0.8, amp: 0.40, noise: "white" },
+      { fc: 4200, q: 0.6, amp: 0.22, noise: "white" },
+    ].forEach(({ fc, q, amp, noise }) => {
+      const src = ctx.createBufferSource();
+      src.buffer = noise === "brown" ? bBuf : wBuf; src.loop = true;
+      const bp = ctx.createBiquadFilter();
+      bp.type = "bandpass"; bp.frequency.value = fc; bp.Q.value = q;
+      const g = ctx.createGain(); g.gain.value = amp;
+      src.connect(bp); bp.connect(g); g.connect(this.gainNode);
+      src.start();
+      this._srcs.push(src); this._bps.push(bp);
+    });
+
+    targetAudioParam(this.gainNode.gain, ctx, this.level * 0.42, 1.5);
+    this._rwalk();
+  }
+
+  _rwalk() {
+    if (!this.active) return;
+    this._bps.forEach(bp => {
+      const cur  = bp.frequency.value;
+      const step = cur * (Math.random() * 0.16 - 0.08); // ±8%
+      bp.frequency.setTargetAtTime(
+        Math.max(100, Math.min(8000, cur + step)),
+        this.ctx.currentTime, 1.2
+      );
+    });
+    this._rwTimer = setTimeout(() => this._rwalk(), (1800 + Math.random() * 1600) / this._rwSpeed);
+  }
+
+  stop() {
+    if (!this.active) return; this.active = false;
+    clearTimeout(this._rwTimer);
+    const t = this.ctx.currentTime;
+    targetAudioParam(this.gainNode.gain, this.ctx, 0, 1.0);
+    this._srcs.forEach(n => { try { n.stop(t + 4); } catch(_) {} });
+    this._srcs = []; this._bps = [];
+  }
+
+  setLevel(v) {
+    this.level = v;
+    if (this.active) targetAudioParam(this.gainNode.gain, this.ctx, v * 0.42, 0.1);
   }
 }
 
@@ -1379,6 +2294,24 @@ const PRESETS = {
     bees: 0.8, birds: 0.6, wind: 0.4, crickets: 0.3,
     drips: 0.2, waterfall: 0.2,
     rain: 0, thunder: false, frogs: 0, swamp: 0, gator: 0, heron: 0,
+  },
+  "Coastal Night": {
+    surf: 0.85, wind: 0.35, creek: 0.2, owl: 0.35,
+    mosquitoes: 0.18, frogs: 0.2, crickets: 0.25,
+    rain: 0, waterfall: 0, thunder: false, birds: 0.1, bees: 0,
+    drips: 0, swamp: 0, wolves: 0, fire: 0, cicadas: 0.15, heron: 0, gator: 0,
+  },
+  "Campfire Creek": {
+    fire: 0.82, creek: 0.78, owl: 0.28, wolves: 0.14,
+    wind: 0.15, drips: 0.12, cicadas: 0.22,
+    rain: 0, waterfall: 0, thunder: false, birds: 0.08, bees: 0,
+    crickets: 0.18, frogs: 0.08, swamp: 0, mosquitoes: 0.05, heron: 0, gator: 0, surf: 0,
+  },
+  "Summer Chorus": {
+    cicadas: 0.9, crickets: 0.45, frogs: 0.32, mosquitoes: 0.25,
+    creek: 0.32, birds: 0.18, wind: 0.12,
+    rain: 0, waterfall: 0, thunder: false, bees: 0.06, drips: 0,
+    swamp: 0, fire: 0, wolves: 0, owl: 0, heron: 0, gator: 0, surf: 0,
   },
 };
 
@@ -1424,14 +2357,18 @@ const LAYER_PARAMS = {
       apply: (s, v) => s.ampLfo && (s.ampLfo.frequency.value = v) },
   ],
   thunder: [
-    { id: "level",     label: "Strike Vol",   min: 0,    max: 1,    step: 0.01, default: 0.8,  unit: "",
+    { id: "level",     label: "Strike Vol",   min: 0,    max: 1.6,  step: 0.01, default: 1.0,  unit: "",
       apply: (s, v) => s.setLevel(v) },
-    { id: "distance",  label: "Distance",     min: 0,    max: 1,    step: 0.01, default: 0.35, unit: "",
+    { id: "distance",  label: "Distance",     min: 0.45, max: 1,    step: 0.01, default: 0.45, unit: "",
       apply: (s, v) => s.setDistance(v) },
     { id: "autoMin",   label: "Auto Min",     min: 4,    max: 60,   step: 1,    default: 8,    unit: "s",
       apply: (s, v) => (s.autoMin = v * 1000) },
     { id: "autoMax",   label: "Auto Max",     min: 10,   max: 120,  step: 1,    default: 33,   unit: "s",
       apply: (s, v) => (s.autoMax = v * 1000) },
+  ],
+  surf: [
+    { id: "washTone",  label: "Wash Tone",    min: 250,  max: 1800, step: 25,   default: 800,  unit: "Hz",
+      apply: (s, v) => s._lp && (s._lp.frequency.value = v) },
   ],
   birds: [
     { id: "callRate",  label: "Call Rate",    min: 0.1,  max: 2,    step: 0.05, default: 1,   unit: "×",
@@ -1461,6 +2398,10 @@ const LAYER_PARAMS = {
     { id: "spread",    label: "Voice Spread", min: 0,    max: 600,  step: 20,   default: 300, unit: "Hz",
       apply: (s, v) => s._oscs && s._oscs.forEach((o, i) => (o.frequency.value = (s._basePitch||4800) + i*v/3)) },
   ],
+  cicadas: [
+    { id: "bodyQ",     label: "Buzz Focus",   min: 8,    max: 35,   step: 1,    default: 22,   unit: "",
+      apply: (s, v) => s._bps && s._bps.forEach(bp => (bp.Q.value = v)) },
+  ],
   frogs: [
     { id: "callRate",  label: "Call Rate",    min: 0.2,  max: 3,    step: 0.1,  default: 1,   unit: "×",
       apply: (s, v) => (s._rateScale = v) },
@@ -1481,6 +2422,16 @@ const LAYER_PARAMS = {
     { id: "tail",      label: "Ring Tail",    min: 0.2,  max: 3,    step: 0.1,  default: 1.2, unit: "s",
       apply: (s, v) => (s._tail = v) },
   ],
+  creek: [
+    { id: "flowSpeed", label: "Flow Motion",  min: 0.4,  max: 2.5,  step: 0.05, default: 1,    unit: "×",
+      apply: (s, v) => (s._rwSpeed = v) },
+  ],
+  fire: [
+    { id: "crackleTone", label: "Crackle Tone", min: 1200, max: 5500, step: 50, default: 3500, unit: "Hz",
+      apply: (s, v) => s._lp && (s._lp.frequency.value = v) },
+    { id: "popRate",     label: "Pop Rate",     min: 0.3,  max: 3,    step: 0.05, default: 1,  unit: "×",
+      apply: (s, v) => (s._popRateScale = v) },
+  ],
   swamp: [
     { id: "rootPitch", label: "Root Pitch",   min: 30,   max: 120,  step: 1,    default: 55,  unit: "Hz",
       apply: (s, v) => s._oscs && s._oscs.filter(o=>o.frequency).forEach((o,i) => {
@@ -1489,6 +2440,18 @@ const LAYER_PARAMS = {
       apply: (s, v) => s._lfos && s._lfos.forEach((l,i) => l.frequency && (l.frequency.value = v+i*0.01)) },
     { id: "noiseLp",   label: "Mud Cutoff",   min: 40,   max: 600,  step: 10,   default: 180, unit: "Hz",
       apply: (s, v) => s._noiseLp && (s._noiseLp.frequency.value = v) },
+  ],
+  owl: [
+    { id: "intervalMult", label: "Call Interval", min: 0.25, max: 4, step: 0.1, default: 1, unit: "×",
+      apply: (s, v) => (s._intervalMult = v) },
+    { id: "pitchBase",    label: "Hoot Pitch",    min: 180,  max: 420, step: 5, default: 280, unit: "Hz",
+      apply: (s, v) => (s._pitchBase = v) },
+  ],
+  wolves: [
+    { id: "intervalMult", label: "Howl Interval", min: 0.25, max: 4, step: 0.1, default: 1, unit: "×",
+      apply: (s, v) => (s._intervalMult = v) },
+    { id: "pitchBase",    label: "Pack Pitch",    min: 140,  max: 320, step: 5, default: 220, unit: "Hz",
+      apply: (s, v) => (s._pitchBase = v) },
   ],
   heron: [
     { id: "intervalMult",label: "Call Interval",min: 0.2,max: 4,   step: 0.1,  default: 1,   unit: "×",
@@ -1513,12 +2476,19 @@ const LAYERS = [
   { id: "waterfall", label: "Waterfall",  icon: "💧",  color: "#00c8ff", category: "weather" },
   { id: "wind",      label: "Wind",       icon: "🌬️",  color: "#a0c4ff", category: "weather" },
   { id: "thunder",   label: "Thunder",    icon: "⚡",   color: "#ffe066", category: "weather" },
+  { id: "surf",      label: "Ocean Surf", icon: "🌊",  color: "#5ed6ff", category: "weather" },
   { id: "birds",     label: "Birds",      icon: "🐦",  color: "#7dde92", category: "nature"  },
   { id: "bees",      label: "Bees",       icon: "🐝",  color: "#ffd700", category: "nature"  },
   { id: "crickets",  label: "Crickets",   icon: "🦗",  color: "#98e08a", category: "nature"  },
+  { id: "cicadas",   label: "Cicadas",    icon: "🪲",  color: "#e9ff7a", category: "nature"  },
   { id: "frogs",     label: "Frogs",      icon: "🐸",  color: "#4ecb71", category: "nature"  },
   { id: "drips",     label: "Drops",      icon: "💦",  color: "#63d0f5", category: "nature"  },
+  { id: "creek",     label: "Creek",      icon: "🏞️",  color: "#78d9ff", category: "nature"  },
+  { id: "fire",      label: "Campfire",   icon: "🔥",  color: "#ff9a4a", category: "nature"  },
+  { id: "wolves",    label: "Wolves",     icon: "🐺",  color: "#c9d6e3", category: "nature"  },
   { id: "swamp",     label: "Swamp Drone",icon: "🌿",  color: "#6bcf8a", category: "everglades" },
+  { id: "owl",       label: "Owls",       icon: "🦉",  color: "#d8c8a8", category: "everglades" },
+  { id: "mosquitoes",label: "Mosquitoes", icon: "🦟",  color: "#e5ff9a", category: "everglades" },
   { id: "heron",     label: "Heron",      icon: "🦢",  color: "#c8e6c9", category: "everglades" },
   { id: "gator",     label: "Gator Rumble",icon: "🐊", color: "#8bc34a", category: "everglades" },
 ];
@@ -1680,16 +2650,15 @@ function parseOscToggleMode(value) {
 //    CC 1  (Mod Wheel) → Master Volume
 //    CC 7  (Volume)    → Master Volume
 //    CC 11 (Expression)→ Reverb Mix
-//    CC 20–31          → Layer levels (rain, waterfall, wind, thunder,
-//                         birds, bees, crickets, frogs, drips, swamp,
-//                         heron, gator)
+//    CC 20 upward      → Layer levels in LAYER_ORDER sequence
 //    CC 64 (Sustain)   → Thunder strike (gate high → trigger)
-//    CC 70–81          → First param of each layer (fine-tune live)
-//    Note On C3-B3     → Layer on/off toggle (12 semitones = 12 layers)
+//    CC 70 upward      → First param of each layer (fine-tune live)
+//    Note On from C3   → Layer on/off toggle in LAYER_ORDER sequence
 // ─────────────────────────────────────────────
 
-const LAYER_ORDER = ["rain","waterfall","wind","thunder","birds","bees",
-                     "crickets","frogs","drips","swamp","heron","gator"];
+const LAYER_ORDER = ["rain","waterfall","wind","thunder","surf","birds","bees",
+                     "crickets","cicadas","frogs","drips","creek","fire","wolves",
+                     "swamp","owl","mosquitoes","heron","gator"];
 
 const MIDI_LEARN_TARGETS = [
   { key: "masterVol", label: "Master Volume" },
@@ -2050,19 +3019,132 @@ function VerticalFader({ value, onChange, color, height = 80 }) {
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  SurroundPositioner — top-down room SVG with draggable source dot
+//
+//  Drag the coloured dot to place a sound layer anywhere in the soundfield.
+//  Speaker icons are drawn at their true azimuth positions.
+//  0° = front-centre. Clockwise = positive (standard audio convention).
+// ─────────────────────────────────────────────────────────────────────────────
+function SurroundPositioner({ azimuth, onChange, color, format, size = 80 }) {
+  const svgRef  = useRef(null);
+  const dragging = useRef(false);
+
+  const R   = size / 2;               // room radius in SVG units
+  const cx  = size / 2;
+  const cy  = size / 2;
+  const sr  = size * 0.36;            // speaker ring radius
+  const dot = Math.max(5, size * 0.1); // source dot radius
+
+  // Convert azimuth (degrees, 0=front, CW) to SVG x/y
+  const azToXY = (az, r) => ({
+    x: cx + r * Math.sin((az * Math.PI) / 180),
+    y: cy - r * Math.cos((az * Math.PI) / 180),
+  });
+
+  const xyToAz = (clientX, clientY) => {
+    const rect = svgRef.current.getBoundingClientRect();
+    const dx   = clientX - (rect.left + rect.width  / 2);
+    const dy   = clientY - (rect.top  + rect.height / 2);
+    return ((Math.atan2(dx, -dy) * 180) / Math.PI + 360) % 360;
+  };
+
+  const onMouseDown = (e) => {
+    e.preventDefault(); dragging.current = true;
+    onChange(xyToAz(e.clientX, e.clientY));
+    const move = (e) => { if (dragging.current) onChange(xyToAz(e.clientX, e.clientY)); };
+    const up   = ()  => { dragging.current = false; window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
+  const onTouchStart = (e) => {
+    e.preventDefault();
+    onChange(xyToAz(e.touches[0].clientX, e.touches[0].clientY));
+    const move = (e) => onChange(xyToAz(e.touches[0].clientX, e.touches[0].clientY));
+    const end  = ()  => { window.removeEventListener("touchmove", move); window.removeEventListener("touchend", end); };
+    window.addEventListener("touchmove", move, { passive: false });
+    window.addEventListener("touchend", end);
+  };
+
+  const srcPos = azToXY(azimuth, sr * 0.6);
+  const azDisplay = azimuth < 0 ? azimuth + 360 : azimuth;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+      <svg ref={svgRef} width={size} height={size}
+        style={{ cursor: "crosshair", userSelect: "none", display: "block" }}
+        onMouseDown={onMouseDown} onTouchStart={onTouchStart}>
+
+        {/* Room boundary */}
+        <circle cx={cx} cy={cy} r={R - 2} fill="none" stroke="#1a2e1c" strokeWidth={1.5} />
+        {/* Front indicator tick */}
+        <line x1={cx} y1={2} x2={cx} y2={cy * 0.32} stroke="#2a4a34" strokeWidth={1} />
+
+        {/* Speaker positions */}
+        {format.speakers.filter(s => !s.lfe).map((sp, i) => {
+          const speakerRadius = sr * (1 - ((sp.el ?? 0) / 90) * 0.35);
+          const { x, y } = azToXY(sp.az, speakerRadius);
+          return (
+            <g key={i}>
+              <circle
+                cx={x}
+                cy={y}
+                r={(sp.el ?? 0) > 0 ? 3.4 : 4}
+                fill={(sp.el ?? 0) > 0 ? "#1d2f3f" : "#1a3a22"}
+                stroke={(sp.el ?? 0) > 0 ? "#72b8ff" : "#3a6a44"}
+                strokeWidth={1}
+              />
+              <text x={x} y={y + 0.5} textAnchor="middle" dominantBaseline="middle"
+                fill={(sp.el ?? 0) > 0 ? "#8dc5ff" : "#3a6a44"}
+                fontSize={Math.max(5, size * 0.07)} fontFamily="monospace">
+                {sp.name}
+              </text>
+            </g>
+          );
+        })}
+
+        {/* Listener position */}
+        <circle cx={cx} cy={cy} r={3} fill="#1a3a22" stroke="#4a7a54" strokeWidth={1} />
+
+        {/* Line from listener to source */}
+        <line x1={cx} y1={cy} x2={srcPos.x} y2={srcPos.y}
+          stroke={color + "55"} strokeWidth={1} strokeDasharray="3 2" />
+
+        {/* Source dot — draggable */}
+        <circle cx={srcPos.x} cy={srcPos.y} r={dot}
+          fill={color + "cc"} stroke={color} strokeWidth={1.5}
+          style={{ filter: `drop-shadow(0 0 ${size * 0.05}px ${color})` }} />
+      </svg>
+      <span style={{ fontSize: 8, color: "#4a7a54", fontFamily: "monospace", letterSpacing: 1 }}>
+        {Math.round(azDisplay)}°
+      </span>
+    </div>
+  );
+}
+
 export default function Ambigram() {
   const [started, setStarted] = useState(false);
   const [masterVol, setMasterVol] = useState(0.85);
   const [reverbMix, setReverbMix] = useState(0.22);
   const [activePreset, setActivePreset] = useState(null);
   const [thunderAuto, setThunderAuto] = useState(false);
-  const [sampleRate, setSampleRate] = useState(96000);
-  const [bitDepth, setBitDepth]     = useState(32);
-  const [actualRate, setActualRate] = useState(null);
-  const [recording, setRecording]   = useState(false);
+  const [sampleRate, setSampleRate]   = useState(96000);
+  const [bitDepth, setBitDepth]       = useState(32);
+  const [actualRate, setActualRate]   = useState(null);
+  const [recording, setRecording]     = useState(false);
   const [recDuration, setRecDuration] = useState(0);
   const recorderRef  = useRef(null);
   const recTimerRef  = useRef(null);
+
+  // Surround format + per-layer azimuth positions
+  const [surroundKey, setSurroundKey] = useState("stereo");
+  const [layerAzimuths, setLayerAzimuths] = useState(() =>
+    Object.fromEntries(Object.entries(LAYER_DEFAULT_AZ).map(([k, v]) => [k, v]))
+  );
+  const setSurroundAz = useCallback((layerId, az) => {
+    setLayerAzimuths(prev => ({ ...prev, [layerId]: az }));
+    engine.setSurroundAz(layerId, az);
+  }, []);
 
   // layerState: { id → { active: bool, level: number } }
   const [layerState, setLayerState] = useState(() =>
@@ -2102,10 +3184,25 @@ export default function Ambigram() {
     }
   }, []);
 
+  const applyStoredParamsToEngine = useCallback((state = paramState) => {
+    Object.entries(state).forEach(([layerId, values]) => {
+      const synth = engine.synths[layerId];
+      if (!synth) return;
+      const defs = LAYER_PARAMS[layerId] || [];
+      defs.forEach(def => {
+        if (!(def.id in values)) return;
+        try { def.apply?.(synth, values[def.id]); } catch (_) {}
+      });
+    });
+  }, [paramState]);
+
   const triggerThunder = useCallback(() => {
     if (!started || !engine.synths.thunder) return;
+    applyStoredParamsToEngine({
+      thunder: paramState.thunder || {},
+    });
     engine.synths.thunder.trigger();
-  }, [started]);
+  }, [applyStoredParamsToEngine, paramState.thunder, started]);
 
   const setLayerLevel = useCallback((id, val) => {
     if (!started) return;
@@ -2200,10 +3297,10 @@ export default function Ambigram() {
     if (event.type === "cc") {
       if (event.controller === 1 || event.controller === 7) return handleCC("masterVol", event.value01);
       if (event.controller === 11) return handleCC("reverbMix", event.value01);
-      if (event.controller >= 20 && event.controller <= 31) {
+      if (event.controller >= 20 && event.controller < 20 + LAYER_ORDER.length) {
         return handleCC(`layer:${LAYER_ORDER[event.controller - 20]}`, event.value01);
       }
-      if (event.controller >= 70 && event.controller <= 81) {
+      if (event.controller >= 70 && event.controller < 70 + LAYER_ORDER.length) {
         return handleCC(`param0:${LAYER_ORDER[event.controller - 70]}`, event.value01);
       }
       if (event.controller === 64) {
@@ -2215,7 +3312,7 @@ export default function Ambigram() {
       return;
     }
 
-    if (event.type === "noteon" && event.note >= 48 && event.note <= 59) {
+    if (event.type === "noteon" && event.note >= 48 && event.note < 48 + LAYER_ORDER.length) {
       handleLayerToggleExternal(LAYER_ORDER[event.note - 48]);
     }
   }, [handleCC, handleLayerToggleExternal, triggerThunder]);
@@ -2405,36 +3502,47 @@ export default function Ambigram() {
     oscRef.current?.disconnect();
   }, []);
 
-  const initAndStart = useCallback(async (sr = sampleRate) => {
-    await engine.init(sr);
+  const initAndStart = useCallback(async (sr = sampleRate, sk = surroundKey) => {
+    await engine.init(sr, sk);
+    applyStoredParamsToEngine();
     setActualRate(engine.actualSampleRate);
     setStarted(true);
-  }, [sampleRate]);
+  }, [applyStoredParamsToEngine, sampleRate, surroundKey]);
+
+  // Shared teardown+reinit helper
+  const restartEngine = useCallback(async (newRate, newKey) => {
+    if (recorderRef.current) {
+      recorderRef.current.destroy(); recorderRef.current = null;
+      setRecording(false); clearInterval(recTimerRef.current);
+    }
+    await engine.teardown();
+    setStarted(false);
+    setLayerState(Object.fromEntries(LAYERS.map(l => [l.id, { active: false, level: 0.5 }])));
+    setThunderAuto(false);
+    await engine.init(newRate, newKey);
+    applyStoredParamsToEngine();
+    setActualRate(engine.actualSampleRate);
+    setStarted(true);
+  }, [applyStoredParamsToEngine]);
 
   // Reinitialize engine when sample rate changes after first start
   const changeSampleRate = useCallback(async (newRate) => {
     setSampleRate(newRate);
     if (!started) return;
-    // Stop recorder if running
-    if (recorderRef.current) {
-      recorderRef.current.destroy();
-      recorderRef.current = null;
-      setRecording(false);
-      clearInterval(recTimerRef.current);
-    }
-    // Tear down and rebuild
-    await engine.teardown();
-    setStarted(false);
-    setLayerState(Object.fromEntries(LAYERS.map(l => [l.id, { active: false, level: 0.5 }])));
-    setThunderAuto(false);
-    await engine.init(newRate);
-    setActualRate(engine.actualSampleRate);
-    setStarted(true);
-  }, [started]);
+    await restartEngine(newRate, surroundKey);
+  }, [started, surroundKey, restartEngine]);
+
+  // Reinitialize engine when surround format changes
+  const changeSurroundFormat = useCallback(async (newKey) => {
+    setSurroundKey(newKey);
+    if (!started) return;
+    await restartEngine(sampleRate, newKey);
+  }, [started, sampleRate, restartEngine]);
 
   const startRecording = useCallback(() => {
     if (!started || recording) return;
-    const recorder = new RecorderNode(engine.ctx, engine.master);
+    const nCh     = engine.surroundFormat?.channels ?? 2;
+    const recorder = new RecorderNode(engine.ctx, engine.master, nCh);
     recorder.start();
     recorderRef.current = recorder;
     setRecording(true);
@@ -2445,7 +3553,7 @@ export default function Ambigram() {
   const stopRecording = useCallback(() => {
     if (!recorderRef.current) return;
     clearInterval(recTimerRef.current);
-    const { L, R, frames } = recorderRef.current.stop();
+    const { channels, frames } = recorderRef.current.stop();
     recorderRef.current.destroy();
     recorderRef.current = null;
     setRecording(false);
@@ -2453,9 +3561,11 @@ export default function Ambigram() {
 
     if (frames === 0) return;
     const sr  = engine.actualSampleRate || engine.sampleRate;
-    const wav = encodeWAV(L, R, sr, bitDepth);
+    const nCh = channels.length;
+    const wav = encodeWAV(channels, sr, bitDepth, engine.surroundFormat?.channelMask);
+    const fmt = nCh > 2 ? `${nCh}ch-` : "";
     const ts  = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    downloadWAV(wav, `ambigram-${ts}-${sr}hz-${bitDepth}bit.wav`);
+    downloadWAV(wav, `ambigram-${ts}-${fmt}${sr}hz-${bitDepth}bit.wav`);
   }, [bitDepth]);
 
   // Master volume
@@ -2549,9 +3659,18 @@ export default function Ambigram() {
                 ))}
               </select>
             </div>
+            <div style={styles.formatGroup}>
+              <label style={styles.formatLabel}>OUTPUT FORMAT</label>
+              <select style={styles.select} value={surroundKey}
+                onChange={e => setSurroundKey(e.target.value)}>
+                {Object.values(SURROUND_FORMATS).map(f => (
+                  <option key={f.key} value={f.key}>{f.label}</option>
+                ))}
+              </select>
+            </div>
           </div>
 
-          <button style={styles.startBtn} onClick={() => initAndStart(sampleRate)}>
+          <button style={styles.startBtn} onClick={() => initAndStart(sampleRate, surroundKey)}>
             ▶ Begin Session
           </button>
           <p style={styles.hint}>Rain · Waterfall · Wind · Birds · Bees · Frogs · Everglades</p>
@@ -2599,6 +3718,13 @@ export default function Ambigram() {
               <option key={b} value={b}>{b}</option>
             ))}
           </select>
+          <label style={{ ...styles.label, marginLeft: 8 }}>OUT</label>
+          <select style={styles.selectSm} value={surroundKey}
+            onChange={e => changeSurroundFormat(e.target.value)}>
+            {Object.values(SURROUND_FORMATS).map(f => (
+              <option key={f.key} value={f.key}>{f.label}</option>
+            ))}
+          </select>
 
           <div style={styles.divider} />
 
@@ -2644,8 +3770,13 @@ export default function Ambigram() {
           </button>
         ))}
         <div style={{ flex: 1 }} />
-        <button style={{ ...styles.presetBtn, borderColor: showControl ? "#c084fc88" : undefined,
-          color: showControl ? "#c084fc" : undefined }}
+        <button style={{
+          ...styles.presetBtn,
+          background: showControl ? "rgba(192,132,252,0.2)" : "rgba(255,255,255,0.08)",
+          borderColor: showControl ? "#c084fc" : "rgba(255,255,255,0.18)",
+          color: showControl ? "#f3ddff" : "#d8e2dc",
+          fontWeight: 700,
+        }}
           onClick={() => setShowControl(v => !v)}>
           ⚡ MIDI / OSC
         </button>
@@ -2658,8 +3789,13 @@ export default function Ambigram() {
           <div style={styles.controlSection}>
             <div style={styles.controlTitle}>MIDI</div>
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-              <button style={{ ...styles.ctrlBtn, borderColor: midiEnabled ? "#7dde92" : "#444",
-                color: midiEnabled ? "#7dde92" : "#888" }}
+              <button style={{
+                ...styles.ctrlBtn,
+                background: midiEnabled ? "rgba(125,222,146,0.18)" : "rgba(255,255,255,0.08)",
+                borderColor: midiEnabled ? "#7dde92" : "#5c6a61",
+                color: midiEnabled ? "#dff7e6" : "#edf3ef",
+                fontWeight: 700,
+              }}
                 onClick={initMIDI}>
                 {midiEnabled ? "✓ MIDI Ready" : "Enable MIDI"}
               </button>
@@ -2712,7 +3848,7 @@ export default function Ambigram() {
             <div style={styles.ctrlNote}>
               Defaults stay active until you learn an override.
               <br/>
-              Legacy toggle notes remain on C3-B3 and param-0 stays on CC 70-81.
+              Legacy toggle notes extend upward from C3 and param-0 stays on CC 70-88.
             </div>
           </div>
 
@@ -2773,13 +3909,24 @@ export default function Ambigram() {
 
                     {/* Left column: always visible */}
                     <div style={{ display: "flex", flexDirection: "column", alignItems: "center",
-                      gap: 8, minWidth: 82 }}>
+                      gap: 8, minWidth: surroundKey !== "stereo" ? 96 : 82 }}>
                       <div style={styles.cardTop}>
                         <span style={{ fontSize: 22 }}>{layer.icon}</span>
                         <span style={{ ...styles.cardLabel, color: isOn ? layer.color : "#aaa" }}>
                           {layer.label}
                         </span>
                       </div>
+
+                      {/* Surround position dial — only shown in multichannel mode */}
+                      {surroundKey !== "stereo" && (
+                        <SurroundPositioner
+                          azimuth={layerAzimuths[layer.id] ?? 0}
+                          onChange={az => setSurroundAz(layer.id, az)}
+                          color={layer.color}
+                          format={SURROUND_FORMATS[surroundKey]}
+                          size={68}
+                        />
+                      )}
 
                       <div style={{ ...styles.dot, background: isOn ? layer.color : "#333" }} />
 
@@ -2946,8 +4093,8 @@ const styles = {
     borderBottom: "1px solid rgba(255,255,255,0.05)",
   },
   presetBtn: {
-    background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)",
-    color: "#7a9e82", padding: "7px 16px", borderRadius: 20, cursor: "pointer",
+    background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.14)",
+    color: "#b7c8bc", padding: "7px 16px", borderRadius: 20, cursor: "pointer",
     fontSize: 12, fontFamily: "inherit", whiteSpace: "nowrap", letterSpacing: 0.5,
     transition: "all 0.15s",
   },
@@ -2997,9 +4144,9 @@ const styles = {
     color: "#c084fc", fontSize: 10, letterSpacing: 3, marginBottom: 2,
   },
   ctrlBtn: {
-    background: "transparent", border: "1px solid #444", borderRadius: 5,
-    color: "#888", padding: "5px 14px", cursor: "pointer",
-    fontSize: 11, fontFamily: "inherit", letterSpacing: 1,
+    background: "rgba(255,255,255,0.08)", border: "1px solid #58655d", borderRadius: 5,
+    color: "#eef4f0", padding: "5px 14px", cursor: "pointer",
+    fontSize: 11, fontFamily: "inherit", letterSpacing: 1, fontWeight: 600,
   },
   ctrlNote: {
     color: "#445", fontSize: 10, lineHeight: 1.7, letterSpacing: 0.5,
