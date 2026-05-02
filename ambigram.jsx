@@ -95,6 +95,38 @@ function applyBufferFade(buffer, fadeInMs = 0, fadeOutMs = fadeInMs) {
   return buffer;
 }
 
+function holdAudioParam(param, ctx) {
+  const t = ctx.currentTime;
+  if (typeof param.cancelAndHoldAtTime === "function") {
+    try {
+      param.cancelAndHoldAtTime(t);
+      return t;
+    } catch (_) {}
+  }
+  const current = param.value;
+  param.cancelScheduledValues(t);
+  param.setValueAtTime(current, t);
+  return t;
+}
+
+function setAudioParamNow(param, ctx, value) {
+  const t = holdAudioParam(param, ctx);
+  param.setValueAtTime(value, t);
+  return t;
+}
+
+function rampAudioParam(param, ctx, value, seconds) {
+  const t = holdAudioParam(param, ctx);
+  param.linearRampToValueAtTime(value, t + seconds);
+  return t;
+}
+
+function targetAudioParam(param, ctx, value, timeConstant) {
+  const t = holdAudioParam(param, ctx);
+  param.setTargetAtTime(value, t, timeConstant);
+  return t;
+}
+
 // ─────────────────────────────────────────────
 //  REVERB — synthetic exponential impulse response
 // ─────────────────────────────────────────────
@@ -729,23 +761,21 @@ class RainSynth {
     this._noise = this.ctx.createBufferSource();
     this._noise.buffer = buf; this._noise.loop = true;
     this._noise.connect(this.bp); this._noise.start();
-    this.gainNode.gain.linearRampToValueAtTime(
-      0.12 + 0.3 * this.level, this.ctx.currentTime + 1.5
-    );
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.12 + 0.3 * this.level, 1.5);
     this._scheduleDrop();
   }
 
   stop() {
     if (!this.active) return; this.active = false;
     clearTimeout(this._dropTimer);
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 2);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 2);
     if (this._noise) { this._noise.stop(this.ctx.currentTime + 2.5); this._noise = null; }
   }
 
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(0.08 + 0.32 * v, this.ctx.currentTime + 0.15);
+      rampAudioParam(this.gainNode.gain, this.ctx, 0.08 + 0.32 * v, 0.15);
   }
 
   _scheduleDrop() {
@@ -805,12 +835,12 @@ class WaterfallSynth {
       this.bands.forEach(bp => g.connect(bp));
       src.start(); this._sources.push(src);
     });
-    this.gainNode.gain.linearRampToValueAtTime(0.1 + 0.4 * this.level, this.ctx.currentTime + 2);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.1 + 0.4 * this.level, 2);
   }
 
   stop() {
     if (!this.active) return; this.active = false;
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 2.5);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 2.5);
     this._sources.forEach(s => s.stop(this.ctx.currentTime + 3));
     this._sources = [];
   }
@@ -818,7 +848,7 @@ class WaterfallSynth {
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(0.08 + 0.42 * v, this.ctx.currentTime + 0.15);
+      rampAudioParam(this.gainNode.gain, this.ctx, 0.08 + 0.42 * v, 0.15);
   }
 }
 
@@ -872,14 +902,14 @@ class WindSynth {
     this._source.buffer = buf; this._source.loop = true;
     this._source.connect(this.lp1); this._source.start();
     const base = 0.08 + 0.25 * this.level;
-    this.gainNode.gain.linearRampToValueAtTime(base, this.ctx.currentTime + 2.5);
+    rampAudioParam(this.gainNode.gain, this.ctx, base, 2.5);
     this.ampLfoGain.gain.value = base * 0.4;
     this.lfoGain.gain.value = 300 + 500 * this.level;
   }
 
   stop() {
     if (!this.active) return; this.active = false;
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 3);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 3);
     if (this._source) { this._source.stop(this.ctx.currentTime + 3.5); this._source = null; }
   }
 
@@ -887,7 +917,7 @@ class WindSynth {
     this.level = v;
     if (this.active) {
       const base = 0.05 + 0.28 * v;
-      this.gainNode.gain.linearRampToValueAtTime(base, this.ctx.currentTime + 0.2);
+      rampAudioParam(this.gainNode.gain, this.ctx, base, 0.2);
       this.ampLfoGain.gain.value = base * 0.4;
       this.lfoGain.gain.value = 250 + 600 * v;
     }
@@ -927,16 +957,28 @@ class ThunderSynth {
     const dist = this.distance;
     const lvl  = this.level;
     const near = this._nearFactor(dist);
+    const bodyDelay = 0.012 + dist * 0.085 + Math.random() * 0.018;
     // Rumble duration: close = shorter + more defined; distant = longer rolling
     const dur  = 2.5 + (1 + dist * 5) * (0.6 + Math.random() * 0.8);
 
-    if (near > 0.12)                      this._crack(t, dist, lvl, near);
-    this._bang(t + dist * 0.06, dist, lvl, near);
-    this._rumble(t + 0.04, dur, dist, lvl, near);
+    if (near > 0.42)                      this._crack(t, dist, lvl, near);
+    this._bang(t + bodyDelay * 0.4, dist, lvl, near);
+    this._rumble(t + bodyDelay, dur, dist, lvl, near, 0);
+    if (dist > 0.58 || Math.random() < 0.72) {
+      const lateDelay = 0.16 + Math.random() * 0.24 + dist * 0.12;
+      this._rumble(
+        t + bodyDelay + lateDelay,
+        dur * (0.48 + Math.random() * 0.22),
+        Math.min(1, dist + 0.08),
+        lvl * 0.74,
+        near * 0.82,
+        1
+      );
+    }
     // 1–3 echo reflections; more when close (reflections are louder)
     const nEchoes = 1 + Math.floor((1.1 - dist) * 2 + Math.random() * 1.5);
     for (let i = 0; i < nEchoes; i++) {
-      this._echo(t + 0.28 + i * (0.22 + Math.random() * 0.45), i, dist, lvl, near);
+      this._echo(t + bodyDelay + 0.24 + i * (0.24 + Math.random() * 0.42), i, dist, lvl, near);
     }
   }
 
@@ -949,25 +991,31 @@ class ThunderSynth {
   // ── 1. Sharp crack: 15–30 ms burst of highpassed white noise
   _crack(t, dist, lvl, near) {
     const ctx      = this.ctx;
-    const dur      = 0.014 + Math.random() * 0.014;
-    const amp      = (0.18 + near * 0.92) * lvl;
-    if (amp <= 0) return;
+    const bursts   = 1 + Math.floor(near * 1.4 + Math.random() * 2);
+    const baseAmp  = (0.08 + near * 0.56) * lvl;
+    if (baseAmp <= 0) return;
 
-    const buf = applyBufferFade(makeWhiteBuffer(ctx, dur + 0.01), 1.5, 1.5);
-    const src = ctx.createBufferSource(); src.buffer = buf;
+    for (let i = 0; i < bursts; i++) {
+      const burstT = t + i * (0.003 + Math.random() * 0.0055);
+      const dur = 0.012 + Math.random() * 0.018;
+      const amp = baseAmp * (1 - i * 0.16) * (0.88 + Math.random() * 0.14);
+      const buf = applyBufferFade(makeWhiteBuffer(ctx, dur + 0.018), 7, 10);
+      const src = ctx.createBufferSource(); src.buffer = buf;
 
-    const hp = ctx.createBiquadFilter();
-    hp.type = "highpass"; hp.frequency.value = 900 + Math.random() * 700;
-    const lp = ctx.createBiquadFilter();
-    lp.type = "lowpass";  lp.frequency.value = 9000;
+      const hp = ctx.createBiquadFilter();
+      hp.type = "highpass"; hp.frequency.value = 650 + Math.random() * 1100 - i * 120;
+      const lp = ctx.createBiquadFilter();
+      lp.type = "lowpass";  lp.frequency.value = 3200 + Math.random() * 1800;
 
-    const env = ctx.createGain(); env.gain.value = 0;
-    env.gain.setValueAtTime(0, t);
-    env.gain.linearRampToValueAtTime(amp, t + 0.001);
-    env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      const env = ctx.createGain(); env.gain.value = 0;
+      env.gain.setValueAtTime(0, burstT);
+      env.gain.linearRampToValueAtTime(amp, burstT + 0.005);
+      env.gain.linearRampToValueAtTime(amp * 0.78, burstT + dur * 0.42);
+      env.gain.exponentialRampToValueAtTime(0.0001, burstT + dur);
 
-    src.connect(hp); hp.connect(lp); lp.connect(env); env.connect(this.dry);
-    src.start(t); src.stop(t + dur + 0.01);
+      src.connect(hp); hp.connect(lp); lp.connect(env); env.connect(this.dry);
+      src.start(burstT); src.stop(burstT + dur + 0.012);
+    }
   }
 
   // ── 2. Initial compression wave: brown noise, two resonant BPs, fast decay
@@ -976,7 +1024,7 @@ class ThunderSynth {
     const dur    = 0.08 + (1 - dist) * 0.28;
     const amp    = (0.58 + near * 0.78) * lvl;
 
-    const buf = applyBufferFade(makeBrownBuffer(ctx, dur + 0.06), 4, 6);
+    const buf = applyBufferFade(makeBrownBuffer(ctx, dur + 0.06), 9, 12);
     const src = ctx.createBufferSource(); src.buffer = buf;
 
     const bp1 = ctx.createBiquadFilter();
@@ -997,45 +1045,56 @@ class ThunderSynth {
   }
 
   // ── 3. Rolling rumble: modal resonators + slow AM for the "rolling" texture
-  _rumble(t, dur, dist, lvl, near) {
+  _rumble(t, dur, dist, lvl, near, pass = 0) {
     const ctx = this.ctx;
-    const buf = applyBufferFade(makeBrownBuffer(ctx, dur + 1.5), 8, 12);
+    const buf = applyBufferFade(makeBrownBuffer(ctx, dur + 1.5), 16, 24);
     const src = ctx.createBufferSource(); src.buffer = buf;
+
+    const airLp = ctx.createBiquadFilter();
+    airLp.type = "lowpass";
+    airLp.frequency.value = 210 + near * 950 - pass * 45;
+    airLp.Q.value = 0.35;
+    src.connect(airLp);
 
     // Modal resonators at thunderclap frequencies
     const modes = [28, 45, 68, 95, 138].map((freq, i) => {
       const bp = ctx.createBiquadFilter();
       bp.type = "bandpass";
-      bp.frequency.value = freq * (0.88 + 0.24 * Math.random());
-      bp.Q.value = 2 + Math.random() * 3.5;
-      const mg = ctx.createGain(); mg.gain.value = 0.6 - i * 0.1;
-      src.connect(bp); bp.connect(mg);
+      bp.frequency.value = freq * (0.84 + 0.28 * Math.random()) * (1 - pass * 0.03);
+      bp.Q.value = 1.35 + Math.random() * 2.1;
+      const mg = ctx.createGain(); mg.gain.value = 0.82 - i * 0.13;
+      airLp.connect(bp); bp.connect(mg);
       return mg;
     });
 
-    // Rolling AM: oscillates between 0.6 and 1.0 at 0.3–1.5 Hz
-    const amRate  = 0.3 + Math.random() * 1.2;
-    const amOsc   = ctx.createOscillator(); amOsc.type = "sine";
-    amOsc.frequency.value = amRate;
-    const amDepth = ctx.createGain(); amDepth.gain.value = 0.2;  // ±0.2
-    const rollG   = ctx.createGain(); rollG.gain.value = 0.8;    // DC = 0.8
-    amOsc.connect(amDepth); amDepth.connect(rollG.gain);          // net: 0.6–1.0
+    // Rolling modulation: two slow, incommensurate LFOs feel less synthetic
+    const amOscA = ctx.createOscillator(); amOscA.type = "sine";
+    amOscA.frequency.value = 0.18 + Math.random() * 0.42;
+    const amOscB = ctx.createOscillator(); amOscB.type = "sine";
+    amOscB.frequency.value = 0.09 + Math.random() * 0.23;
+    const amDepthA = ctx.createGain(); amDepthA.gain.value = 0.12;
+    const amDepthB = ctx.createGain(); amDepthB.gain.value = 0.08;
+    const rollG   = ctx.createGain(); rollG.gain.value = 0.86;
+    amOscA.connect(amDepthA); amDepthA.connect(rollG.gain);
+    amOscB.connect(amDepthB); amDepthB.connect(rollG.gain);
 
     // Outer envelope — fade in then long slow decay
-    const amp    = (0.36 + near * 0.62) * lvl;
+    const amp    = (0.32 + near * 0.56) * lvl * (pass === 0 ? 1 : 0.82);
     const envG   = ctx.createGain(); envG.gain.value = 0;
     envG.gain.setValueAtTime(0, t);
-    envG.gain.linearRampToValueAtTime(amp, t + 0.35);
-    // Mid-rumble swell ±15%
-    const swell  = amp * (0.85 + Math.random() * 0.30);
-    envG.gain.linearRampToValueAtTime(swell, t + dur * 0.35);
+    envG.gain.linearRampToValueAtTime(amp * (0.82 + Math.random() * 0.12), t + 0.22 + pass * 0.06);
+    const swellA = amp * (0.92 + Math.random() * 0.16);
+    const swellB = amp * (0.70 + Math.random() * 0.20);
+    envG.gain.linearRampToValueAtTime(swellA, t + dur * 0.28);
+    envG.gain.linearRampToValueAtTime(swellB, t + dur * 0.58);
     envG.gain.exponentialRampToValueAtTime(0.0001, t + dur);
 
     modes.forEach(mg => mg.connect(rollG));
     rollG.connect(envG);
     envG.connect(this.dry); envG.connect(this.wet);
 
-    amOsc.start(t); amOsc.stop(t + dur + 1.5);
+    amOscA.start(t); amOscA.stop(t + dur + 1.5);
+    amOscB.start(t); amOscB.stop(t + dur + 1.5);
     src.start(t);   src.stop(t + dur + 1.5);
   }
 
@@ -1045,7 +1104,7 @@ class ThunderSynth {
     const dur    = 0.12 + Math.random() * 0.22;
     const amp    = lvl * (0.16 + near * 0.16) * Math.pow(0.5, idx) * (0.55 + dist * 0.45);
 
-    const buf = applyBufferFade(makeBrownBuffer(ctx, dur + 0.06), 4, 6);
+    const buf = applyBufferFade(makeBrownBuffer(ctx, dur + 0.06), 9, 12);
     const src = ctx.createBufferSource(); src.buffer = buf;
 
     const lp = ctx.createBiquadFilter();
@@ -1099,7 +1158,7 @@ class BirdSynth {
 
   start() {
     if (this.active) return; this.active = true;
-    this.masterGain.gain.linearRampToValueAtTime(0.15 + 0.3 * this.level, this.ctx.currentTime + 1);
+    rampAudioParam(this.masterGain.gain, this.ctx, 0.15 + 0.3 * this.level, 1);
     this._scheduleBird();
   }
 
@@ -1107,13 +1166,13 @@ class BirdSynth {
     if (!this.active) return; this.active = false;
     this._timers.forEach(t => clearTimeout(t));
     this._timers = [];
-    this.masterGain.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 2);
+    rampAudioParam(this.masterGain.gain, this.ctx, 0.0001, 2);
   }
 
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.masterGain.gain.linearRampToValueAtTime(0.12 + 0.33 * v, this.ctx.currentTime + 0.2);
+      rampAudioParam(this.masterGain.gain, this.ctx, 0.12 + 0.33 * v, 0.2);
   }
 
   _scheduleBird() {
@@ -1202,12 +1261,12 @@ class BeeSynth {
     this.gainNode.disconnect(); this.gainNode.connect(lp);
     lp.connect(dry); lp.connect(wet); this._lp = lp;
 
-    this.gainNode.gain.linearRampToValueAtTime(0.08 + 0.18 * this.level, ctx.currentTime + 1.5);
+    rampAudioParam(this.gainNode.gain, ctx, 0.08 + 0.18 * this.level, 1.5);
   }
 
   stop() {
     if (!this.active) return; this.active = false;
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 2);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 2);
     this._oscs.forEach(o => o.stop(this.ctx.currentTime + 2.5));
     if (this._lfo) this._lfo.stop(this.ctx.currentTime + 2.5);
     this._oscs = [];
@@ -1216,7 +1275,7 @@ class BeeSynth {
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(0.06 + 0.2 * v, this.ctx.currentTime + 0.15);
+      rampAudioParam(this.gainNode.gain, this.ctx, 0.06 + 0.2 * v, 0.15);
   }
 }
 
@@ -1253,12 +1312,12 @@ class CricketSynth {
       this._oscs.push(osc); this._lfos.push(lfo);
     });
 
-    this.gainNode.gain.linearRampToValueAtTime(0.1 + 0.25 * this.level, ctx.currentTime + 2);
+    rampAudioParam(this.gainNode.gain, ctx, 0.1 + 0.25 * this.level, 2);
   }
 
   stop() {
     if (!this.active) return; this.active = false;
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 2);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 2);
     [...this._oscs, ...this._lfos].forEach(o => o.stop(this.ctx.currentTime + 2.5));
     this._oscs = []; this._lfos = [];
   }
@@ -1266,7 +1325,7 @@ class CricketSynth {
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(0.08 + 0.28 * v, this.ctx.currentTime + 0.15);
+      rampAudioParam(this.gainNode.gain, this.ctx, 0.08 + 0.28 * v, 0.15);
   }
 }
 
@@ -1336,20 +1395,20 @@ class FrogSynth {
 
   start() {
     if (this.active) return; this.active = true;
-    this.gainNode.gain.linearRampToValueAtTime(1.0, this.ctx.currentTime + 1);
+    rampAudioParam(this.gainNode.gain, this.ctx, 1.0, 1);
     this._scheduleFrog();
   }
 
   stop() {
     if (!this.active) return; this.active = false;
     this._timers.forEach(t => clearTimeout(t)); this._timers = [];
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 2);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 2);
   }
 
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(1.0, this.ctx.currentTime + 0.2);
+      rampAudioParam(this.gainNode.gain, this.ctx, 1.0, 0.2);
   }
 
   _scheduleFrog() {
@@ -1508,20 +1567,20 @@ class WaterDripSynth {
 
   start() {
     if (this.active) return; this.active = true;
-    this.gainNode.gain.linearRampToValueAtTime(0.12 + 0.3 * this.level, this.ctx.currentTime + 0.5);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.12 + 0.3 * this.level, 0.5);
     this._schedule();
   }
 
   stop() {
     if (!this.active) return; this.active = false;
     clearTimeout(this._timer);
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 1);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 1);
   }
 
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(0.1 + 0.32 * v, this.ctx.currentTime + 0.1);
+      rampAudioParam(this.gainNode.gain, this.ctx, 0.1 + 0.32 * v, 0.1);
   }
 
   _schedule() {
@@ -1590,12 +1649,12 @@ class SwampSynth {
     noiseG.connect(this.gainNode);
     noiseSrc.start(); this._oscs.push(noiseSrc);
 
-    this.gainNode.gain.linearRampToValueAtTime(0.12 + 0.28 * this.level, ctx.currentTime + 3);
+    rampAudioParam(this.gainNode.gain, ctx, 0.12 + 0.28 * this.level, 3);
   }
 
   stop() {
     if (!this.active) return; this.active = false;
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 3);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 3);
     [...this._oscs, ...this._lfos].forEach(o => { try { o.stop(this.ctx.currentTime + 3.5); } catch(_){} });
     this._oscs = []; this._lfos = []; this._noiseLp = null;
   }
@@ -1603,7 +1662,7 @@ class SwampSynth {
   setLevel(v) {
     this.level = v;
     if (this.active)
-      this.gainNode.gain.linearRampToValueAtTime(0.1 + 0.3 * v, this.ctx.currentTime + 0.2);
+      rampAudioParam(this.gainNode.gain, this.ctx, 0.1 + 0.3 * v, 0.2);
   }
 }
 
@@ -1617,21 +1676,24 @@ class HeronSynth {
     this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
     this.gainNode.connect(dry); this.gainNode.connect(wet);
     this._timer = null;
+    this._previewTimer = null;
   }
 
   start() {
     if (this.active) return; this.active = true;
-    this.gainNode.gain.value = this.level * 0.4;
+    setAudioParamNow(this.gainNode.gain, this.ctx, this.level * 0.4);
+    this._previewTimer = setTimeout(() => { if (this.active) this._call(); }, 180 + Math.random() * 220);
     this._schedule();
   }
 
   stop() {
     if (!this.active) return; this.active = false;
     clearTimeout(this._timer);
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 1);
+    clearTimeout(this._previewTimer);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 1);
   }
 
-  setLevel(v) { this.level = v; if (this.active) this.gainNode.gain.value = v * 0.4; }
+  setLevel(v) { this.level = v; if (this.active) setAudioParamNow(this.gainNode.gain, this.ctx, v * 0.4); }
 
   _schedule() {
     if (!this.active) return;
@@ -1669,21 +1731,24 @@ class GatorSynth {
     this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
     this.gainNode.connect(dry); this.gainNode.connect(wet);
     this._timer = null;
+    this._previewTimer = null;
   }
 
   start() {
     if (this.active) return; this.active = true;
-    this.gainNode.gain.value = this.level * 0.35;
+    setAudioParamNow(this.gainNode.gain, this.ctx, this.level * 0.35);
+    this._previewTimer = setTimeout(() => { if (this.active) this._bellow(); }, 220 + Math.random() * 260);
     this._schedule();
   }
 
   stop() {
     if (!this.active) return; this.active = false;
     clearTimeout(this._timer);
-    this.gainNode.gain.linearRampToValueAtTime(0.0001, this.ctx.currentTime + 1);
+    clearTimeout(this._previewTimer);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0.0001, 1);
   }
 
-  setLevel(v) { this.level = v; if (this.active) this.gainNode.gain.value = v * 0.35; }
+  setLevel(v) { this.level = v; if (this.active) setAudioParamNow(this.gainNode.gain, this.ctx, v * 0.35); }
 
   _schedule() {
     if (!this.active) return;
@@ -1752,20 +1817,20 @@ class CicadaSynth {
       src.start(); amLfo.start();
       this._srcs.push(src); this._amLfos.push(amLfo); this._bps.push(bp);
     });
-    this.gainNode.gain.setTargetAtTime(this.level * 0.28, ctx.currentTime, 1.5);
+    targetAudioParam(this.gainNode.gain, ctx, this.level * 0.28, 1.5);
   }
 
   stop() {
     if (!this.active) return; this.active = false;
     const t = this.ctx.currentTime;
-    this.gainNode.gain.setTargetAtTime(0, t, 0.8);
+    targetAudioParam(this.gainNode.gain, this.ctx, 0, 0.8);
     [...this._srcs, ...this._amLfos].forEach(n => { try { n.stop(t + 4); } catch(_) {} });
     this._srcs = []; this._amLfos = []; this._bps = [];
   }
 
   setLevel(v) {
     this.level = v;
-    if (this.active) this.gainNode.gain.setTargetAtTime(v * 0.28, this.ctx.currentTime, 0.1);
+    if (this.active) targetAudioParam(this.gainNode.gain, this.ctx, v * 0.28, 0.1);
   }
 }
 
@@ -1824,20 +1889,20 @@ class SurfSynth {
 
     src.start(); bSrc.start(); lfo.start(); ampLfo.start();
     this._nodes = [src, bSrc, lfo, ampLfo];
-    this.gainNode.gain.setTargetAtTime(this.level * 0.45, ctx.currentTime, 2);
+    targetAudioParam(this.gainNode.gain, ctx, this.level * 0.45, 2);
   }
 
   stop() {
     if (!this.active) return; this.active = false;
     const t = this.ctx.currentTime;
-    this.gainNode.gain.setTargetAtTime(0, t, 1.5);
+    targetAudioParam(this.gainNode.gain, this.ctx, 0, 1.5);
     this._nodes.forEach(n => { try { n.stop(t + 6); } catch(_) {} });
     this._nodes = [];
   }
 
   setLevel(v) {
     this.level = v;
-    if (this.active) this.gainNode.gain.setTargetAtTime(v * 0.45, this.ctx.currentTime, 0.15);
+    if (this.active) targetAudioParam(this.gainNode.gain, this.ctx, v * 0.45, 0.15);
   }
 }
 
@@ -1851,19 +1916,27 @@ class OwlSynth {
     this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
     this.gainNode.connect(dry); this.gainNode.connect(wet);
     this._timer = null;
+    this._previewTimer = null;
     this._intervalMult = 1;
     this._pitchBase    = 280;
   }
 
-  start() { if (this.active) return; this.active = true; this._schedule(); }
+  start() {
+    if (this.active) return;
+    this.active = true;
+    setAudioParamNow(this.gainNode.gain, this.ctx, this.level);
+    this._previewTimer = setTimeout(() => { if (this.active) this._call(); }, 150 + Math.random() * 200);
+    this._schedule();
+  }
 
   stop() {
     if (!this.active) return; this.active = false;
     clearTimeout(this._timer);
-    this.gainNode.gain.linearRampToValueAtTime(0, this.ctx.currentTime + 0.5);
+    clearTimeout(this._previewTimer);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0, 0.5);
   }
 
-  setLevel(v) { this.level = v; }
+  setLevel(v) { this.level = v; if (this.active) setAudioParamNow(this.gainNode.gain, this.ctx, v); }
 
   _schedule() {
     if (!this.active) return;
@@ -1951,7 +2024,7 @@ class FireSynth {
 
     wSrc.start(); bSrc.start(); flameLfo.start();
     this._srcs = [wSrc, bSrc, flameLfo];
-    this.gainNode.gain.setTargetAtTime(this.level * 0.35, ctx.currentTime, 1.0);
+    targetAudioParam(this.gainNode.gain, ctx, this.level * 0.35, 1.0);
     this._popLoop();
   }
 
@@ -1978,14 +2051,14 @@ class FireSynth {
     if (!this.active) return; this.active = false;
     clearTimeout(this._popTimer);
     const t = this.ctx.currentTime;
-    this.gainNode.gain.setTargetAtTime(0, t, 1.0);
+    targetAudioParam(this.gainNode.gain, this.ctx, 0, 1.0);
     this._srcs.forEach(n => { try { n.stop(t + 4); } catch(_) {} });
     this._srcs = [];
   }
 
   setLevel(v) {
     this.level = v;
-    if (this.active) this.gainNode.gain.setTargetAtTime(v * 0.35, this.ctx.currentTime, 0.1);
+    if (this.active) targetAudioParam(this.gainNode.gain, this.ctx, v * 0.35, 0.1);
   }
 }
 
@@ -1999,19 +2072,27 @@ class WolfSynth {
     this.gainNode = ctx.createGain(); this.gainNode.gain.value = 0;
     this.gainNode.connect(dry); this.gainNode.connect(wet);
     this._timer = null;
+    this._previewTimer = null;
     this._intervalMult = 1;
     this._pitchBase    = 220;
   }
 
-  start() { if (this.active) return; this.active = true; this._schedule(); }
+  start() {
+    if (this.active) return;
+    this.active = true;
+    setAudioParamNow(this.gainNode.gain, this.ctx, this.level);
+    this._previewTimer = setTimeout(() => { if (this.active) this._pack(); }, 180 + Math.random() * 260);
+    this._schedule();
+  }
 
   stop() {
     if (!this.active) return; this.active = false;
     clearTimeout(this._timer);
-    this.gainNode.gain.linearRampToValueAtTime(0, this.ctx.currentTime + 1.5);
+    clearTimeout(this._previewTimer);
+    rampAudioParam(this.gainNode.gain, this.ctx, 0, 1.5);
   }
 
-  setLevel(v) { this.level = v; }
+  setLevel(v) { this.level = v; if (this.active) setAudioParamNow(this.gainNode.gain, this.ctx, v); }
 
   _schedule() {
     if (!this.active) return;
@@ -2095,20 +2176,20 @@ class MosquitoSynth {
       this._oscs.push(osc); this._lfos.push(drift, prox);
     });
 
-    this.gainNode.gain.setTargetAtTime(this.level * 0.07, ctx.currentTime, 0.5);
+    targetAudioParam(this.gainNode.gain, ctx, this.level * 0.07, 0.5);
   }
 
   stop() {
     if (!this.active) return; this.active = false;
     const t = this.ctx.currentTime;
-    this.gainNode.gain.setTargetAtTime(0, t, 0.3);
+    targetAudioParam(this.gainNode.gain, this.ctx, 0, 0.3);
     [...this._oscs, ...this._lfos].forEach(n => { try { n.stop(t + 1); } catch(_) {} });
     this._oscs = []; this._lfos = [];
   }
 
   setLevel(v) {
     this.level = v;
-    if (this.active) this.gainNode.gain.setTargetAtTime(v * 0.07, this.ctx.currentTime, 0.1);
+    if (this.active) targetAudioParam(this.gainNode.gain, this.ctx, v * 0.07, 0.1);
   }
 }
 
@@ -2147,7 +2228,7 @@ class CreekSynth {
       this._srcs.push(src); this._bps.push(bp);
     });
 
-    this.gainNode.gain.setTargetAtTime(this.level * 0.42, ctx.currentTime, 1.5);
+    targetAudioParam(this.gainNode.gain, ctx, this.level * 0.42, 1.5);
     this._rwalk();
   }
 
@@ -2168,14 +2249,14 @@ class CreekSynth {
     if (!this.active) return; this.active = false;
     clearTimeout(this._rwTimer);
     const t = this.ctx.currentTime;
-    this.gainNode.gain.setTargetAtTime(0, t, 1.0);
+    targetAudioParam(this.gainNode.gain, this.ctx, 0, 1.0);
     this._srcs.forEach(n => { try { n.stop(t + 4); } catch(_) {} });
     this._srcs = []; this._bps = [];
   }
 
   setLevel(v) {
     this.level = v;
-    if (this.active) this.gainNode.gain.setTargetAtTime(v * 0.42, this.ctx.currentTime, 0.1);
+    if (this.active) targetAudioParam(this.gainNode.gain, this.ctx, v * 0.42, 0.1);
   }
 }
 
@@ -3103,10 +3184,25 @@ export default function Ambigram() {
     }
   }, []);
 
+  const applyStoredParamsToEngine = useCallback((state = paramState) => {
+    Object.entries(state).forEach(([layerId, values]) => {
+      const synth = engine.synths[layerId];
+      if (!synth) return;
+      const defs = LAYER_PARAMS[layerId] || [];
+      defs.forEach(def => {
+        if (!(def.id in values)) return;
+        try { def.apply?.(synth, values[def.id]); } catch (_) {}
+      });
+    });
+  }, [paramState]);
+
   const triggerThunder = useCallback(() => {
     if (!started || !engine.synths.thunder) return;
+    applyStoredParamsToEngine({
+      thunder: paramState.thunder || {},
+    });
     engine.synths.thunder.trigger();
-  }, [started]);
+  }, [applyStoredParamsToEngine, paramState.thunder, started]);
 
   const setLayerLevel = useCallback((id, val) => {
     if (!started) return;
@@ -3408,9 +3504,10 @@ export default function Ambigram() {
 
   const initAndStart = useCallback(async (sr = sampleRate, sk = surroundKey) => {
     await engine.init(sr, sk);
+    applyStoredParamsToEngine();
     setActualRate(engine.actualSampleRate);
     setStarted(true);
-  }, [sampleRate, surroundKey]);
+  }, [applyStoredParamsToEngine, sampleRate, surroundKey]);
 
   // Shared teardown+reinit helper
   const restartEngine = useCallback(async (newRate, newKey) => {
@@ -3423,9 +3520,10 @@ export default function Ambigram() {
     setLayerState(Object.fromEntries(LAYERS.map(l => [l.id, { active: false, level: 0.5 }])));
     setThunderAuto(false);
     await engine.init(newRate, newKey);
+    applyStoredParamsToEngine();
     setActualRate(engine.actualSampleRate);
     setStarted(true);
-  }, []);
+  }, [applyStoredParamsToEngine]);
 
   // Reinitialize engine when sample rate changes after first start
   const changeSampleRate = useCallback(async (newRate) => {
