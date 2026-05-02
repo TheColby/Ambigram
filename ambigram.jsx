@@ -785,7 +785,7 @@ class WindSynth {
 class ThunderSynth {
   constructor(ctx, dry, wet) {
     this.ctx = ctx; this.dry = dry; this.wet = wet;
-    this.level    = 0.8;
+    this.level    = 1.0;
     this.distance = 0.45; // 0 = close/sharp, 1 = distant/rolling
     this.autoMin  = 8000;
     this.autoMax  = 33000;
@@ -800,24 +800,31 @@ class ThunderSynth {
     const t    = ctx.currentTime + 0.15;  // 150 ms look-ahead
     const dist = this.distance;
     const lvl  = this.level;
+    const near = this._nearFactor(dist);
     // Rumble duration: close = shorter + more defined; distant = longer rolling
     const dur  = 2.5 + (1 + dist * 5) * (0.6 + Math.random() * 0.8);
 
-    if (dist < 0.5)                       this._crack(t, dist, lvl);
-    this._bang(t + dist * 0.06, dist, lvl);
-    this._rumble(t + 0.04, dur, dist, lvl);
+    if (near > 0.12)                      this._crack(t, dist, lvl, near);
+    this._bang(t + dist * 0.06, dist, lvl, near);
+    this._rumble(t + 0.04, dur, dist, lvl, near);
     // 1–3 echo reflections; more when close (reflections are louder)
     const nEchoes = 1 + Math.floor((1.1 - dist) * 2 + Math.random() * 1.5);
     for (let i = 0; i < nEchoes; i++) {
-      this._echo(t + 0.28 + i * (0.22 + Math.random() * 0.45), i, dist, lvl);
+      this._echo(t + 0.28 + i * (0.22 + Math.random() * 0.45), i, dist, lvl, near);
     }
   }
 
+  _nearFactor(dist) {
+    // Re-map the current thunder distance range (0.45..1) so "closest"
+    // strikes still hit hard even though the slider no longer goes to 0.
+    return Math.max(0, Math.min(1, 1 - ((dist - 0.45) / 0.55)));
+  }
+
   // ── 1. Sharp crack: 15–30 ms burst of highpassed white noise
-  _crack(t, dist, lvl) {
+  _crack(t, dist, lvl, near) {
     const ctx      = this.ctx;
     const dur      = 0.014 + Math.random() * 0.014;
-    const amp      = (0.55 - dist * 1.1) * lvl;
+    const amp      = (0.18 + near * 0.92) * lvl;
     if (amp <= 0) return;
 
     const buf = makeWhiteBuffer(ctx, dur + 0.01);
@@ -838,10 +845,10 @@ class ThunderSynth {
   }
 
   // ── 2. Initial compression wave: brown noise, two resonant BPs, fast decay
-  _bang(t, dist, lvl) {
+  _bang(t, dist, lvl, near) {
     const ctx    = this.ctx;
     const dur    = 0.08 + (1 - dist) * 0.28;
-    const amp    = (0.72 - dist * 0.28) * lvl;
+    const amp    = (0.58 + near * 0.78) * lvl;
 
     const buf = makeBrownBuffer(ctx, dur + 0.06);
     const src = ctx.createBufferSource(); src.buffer = buf;
@@ -864,7 +871,7 @@ class ThunderSynth {
   }
 
   // ── 3. Rolling rumble: modal resonators + slow AM for the "rolling" texture
-  _rumble(t, dur, dist, lvl) {
+  _rumble(t, dur, dist, lvl, near) {
     const ctx = this.ctx;
     const buf = makeBrownBuffer(ctx, dur + 1.5);
     const src = ctx.createBufferSource(); src.buffer = buf;
@@ -889,7 +896,7 @@ class ThunderSynth {
     amOsc.connect(amDepth); amDepth.connect(rollG.gain);          // net: 0.6–1.0
 
     // Outer envelope — fade in then long slow decay
-    const amp    = (0.45 + (1 - dist) * 0.35) * lvl;
+    const amp    = (0.36 + near * 0.62) * lvl;
     const envG   = ctx.createGain(); envG.gain.value = 0;
     envG.gain.setValueAtTime(0, t);
     envG.gain.linearRampToValueAtTime(amp, t + 0.35);
@@ -907,10 +914,10 @@ class ThunderSynth {
   }
 
   // ── 4. Echo reflections: each increasingly low-passed and quieter
-  _echo(t, idx, dist, lvl) {
+  _echo(t, idx, dist, lvl, near) {
     const ctx    = this.ctx;
     const dur    = 0.12 + Math.random() * 0.22;
-    const amp    = lvl * 0.22 * Math.pow(0.5, idx) * (0.4 + dist * 0.6);
+    const amp    = lvl * (0.16 + near * 0.16) * Math.pow(0.5, idx) * (0.55 + dist * 0.45);
 
     const buf = makeBrownBuffer(ctx, dur + 0.06);
     const src = ctx.createBufferSource(); src.buffer = buf;
@@ -2143,7 +2150,7 @@ const LAYER_PARAMS = {
       apply: (s, v) => s.ampLfo && (s.ampLfo.frequency.value = v) },
   ],
   thunder: [
-    { id: "level",     label: "Strike Vol",   min: 0,    max: 1,    step: 0.01, default: 0.8,  unit: "",
+    { id: "level",     label: "Strike Vol",   min: 0,    max: 1.6,  step: 0.01, default: 1.0,  unit: "",
       apply: (s, v) => s.setLevel(v) },
     { id: "distance",  label: "Distance",     min: 0.45, max: 1,    step: 0.01, default: 0.45, unit: "",
       apply: (s, v) => s.setDistance(v) },
