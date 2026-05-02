@@ -73,6 +73,28 @@ function makeBrownBuffer(ctx, sec = 3) {
   return buf;
 }
 
+function applyBufferFade(buffer, fadeInMs = 0, fadeOutMs = fadeInMs) {
+  const fadeInSamples = Math.max(0, Math.floor((fadeInMs / 1000) * buffer.sampleRate));
+  const fadeOutSamples = Math.max(0, Math.floor((fadeOutMs / 1000) * buffer.sampleRate));
+
+  for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+    const data = buffer.getChannelData(ch);
+    const n = data.length;
+
+    for (let i = 0; i < fadeInSamples && i < n; i++) {
+      data[i] *= i / Math.max(1, fadeInSamples);
+    }
+
+    for (let i = 0; i < fadeOutSamples && i < n; i++) {
+      const idx = n - 1 - i;
+      if (idx < 0) break;
+      data[idx] *= i / Math.max(1, fadeOutSamples);
+    }
+  }
+
+  return buffer;
+}
+
 // ─────────────────────────────────────────────
 //  REVERB — synthetic exponential impulse response
 // ─────────────────────────────────────────────
@@ -931,7 +953,7 @@ class ThunderSynth {
     const amp      = (0.18 + near * 0.92) * lvl;
     if (amp <= 0) return;
 
-    const buf = makeWhiteBuffer(ctx, dur + 0.01);
+    const buf = applyBufferFade(makeWhiteBuffer(ctx, dur + 0.01), 1.5, 1.5);
     const src = ctx.createBufferSource(); src.buffer = buf;
 
     const hp = ctx.createBiquadFilter();
@@ -954,7 +976,7 @@ class ThunderSynth {
     const dur    = 0.08 + (1 - dist) * 0.28;
     const amp    = (0.58 + near * 0.78) * lvl;
 
-    const buf = makeBrownBuffer(ctx, dur + 0.06);
+    const buf = applyBufferFade(makeBrownBuffer(ctx, dur + 0.06), 4, 6);
     const src = ctx.createBufferSource(); src.buffer = buf;
 
     const bp1 = ctx.createBiquadFilter();
@@ -977,7 +999,7 @@ class ThunderSynth {
   // ── 3. Rolling rumble: modal resonators + slow AM for the "rolling" texture
   _rumble(t, dur, dist, lvl, near) {
     const ctx = this.ctx;
-    const buf = makeBrownBuffer(ctx, dur + 1.5);
+    const buf = applyBufferFade(makeBrownBuffer(ctx, dur + 1.5), 8, 12);
     const src = ctx.createBufferSource(); src.buffer = buf;
 
     // Modal resonators at thunderclap frequencies
@@ -1023,7 +1045,7 @@ class ThunderSynth {
     const dur    = 0.12 + Math.random() * 0.22;
     const amp    = lvl * (0.16 + near * 0.16) * Math.pow(0.5, idx) * (0.55 + dist * 0.45);
 
-    const buf = makeBrownBuffer(ctx, dur + 0.06);
+    const buf = applyBufferFade(makeBrownBuffer(ctx, dur + 0.06), 4, 6);
     const src = ctx.createBufferSource(); src.buffer = buf;
 
     const lp = ctx.createBiquadFilter();
